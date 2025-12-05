@@ -1,0 +1,3735 @@
+---
+title: "SLAMseq 2206"
+output: html_notebook
+---
+
+# Location of files: /pipeline/Runs/NovaSeq/220622_A01524_0035_BHHYWMDRX2/ProjectFolders/Project_Kathy-Knezevic/
+
+# set up project dir
+```{bash}
+mkdir scripts
+mkdir session-info
+mkdir logs
+mkdir alignment
+mkdir fastqc
+mkdir results
+mkdir plots
+```
+
+# sequencing is in separate lanes, so fastqs need to be combined first, then comb fastqs can be deleted after alignment to save space as originals will be preserved
+```{bash}
+for fq in /pipeline/Runs/NovaSeq/220622_A01524_0035_BHHYWMDRX2/ProjectFolders/Project_Kathy-Knezevic/*/*_L001_R1_001.fastq.gz
+do 
+sname=`basename $fq _L001_R1_001.fastq.gz`
+cat $fq /pipeline/Runs/NovaSeq/220622_A01524_0035_BHHYWMDRX2/ProjectFolders/Project_Kathy-Knezevic/*/${sname}_L002_R1_001.fastq.gz > comb_fastq/${sname}_R1_001.fastq.gz
+done
+```
+
+# run fastqc on raw fastqs first
+```{bash}
+for fq in comb_fastq/*.fastq.gz
+do 
+sbatch scripts/fastqc.sbatch $fq
+done
+
+# run multiqc to collate all raw fastqcs here
+module load multiqc/1.8
+multiqc -o fastqc fastqc
+```
+
+# create references needed, joint MmDm 3'utr
+Get Dm 3'UTR coordinates first
+```{r}
+library(biomaRt)
+
+Dm6ensembl = useMart(
+  host = "https://asia.ensembl.org", 
+  biomart = 'ENSEMBL_MART_ENSEMBL', 
+  dataset = 'dmelanogaster_gene_ensembl'
+  )
+
+# file generated from ensembl website, used in previous experiment, just use this path to avoid unnecessary duplication of data
+Dm6enz <- read.delim("/dawson_genomics/Projects/zebrafish/SLAMSeq/210922_NB501056_0694_AHJJHWBGXK/reference_files/Drosophila_melanogaster_BDGP6.32.txt", header = T) 
+# removing duplicates of ENS gene ID
+Dm6FBgn <- Dm6enz[!duplicated(Dm6enz[, 1]), ]
+
+utr <- getBM(
+  attributes = c('chromosome_name','3_utr_start','3_utr_end','ensembl_gene_id','external_gene_name','strand','ensembl_transcript_id'), 
+  filters = 'ensembl_gene_id',
+  values = Dm6FBgn$Gene.stable.ID, 
+  mart = Dm6ensembl
+  )
+
+utrna <- utr[!is.na(utr$`3_utr_start`),]
+utrna$strand2 <- ifelse(utrna$strand == "-1", "-", "+")
+
+write.table(
+  utrna[, c(1:5, 8)],
+  "reference_files/Dm6allutr.bed", 
+  sep = "\t", 
+  quote = F,
+  row.names = F,
+  col.names = F
+  )
+```
+
+# sort dm utr bed
+```{bash}
+module load bedtools/2.27.1 
+
+cd reference_files
+sort -k1,1 -k2,2n Dm6allutr.bed > Dm6allutrsort.bed
+
+bedtools merge -c 4,5,6 -o distinct,distinct,distinct -s -i Dm6allutrsort.bed > Dm6allutrmerge.bed
+```
+
+Changing chromosome prefix
+```{r}
+utr = read.delim("reference_files/Dm6allutrmerge.bed", header = F)
+table(utr$V1)
+utr$V1 <- as.character(utr$V1)
+utr$V1 <- paste("DM", utr$V1, sep = "_" ) 
+table(utr$V1)
+
+names(utr) = c("chr", "start", "end", "ensembl", "gene.id", "strand")
+
+write.table(utr, "reference_files/Dm6allutrmergechr.bed", sep = "\t", quote = F, row.names = F, col.names = F)
+```
+
+
+# now same for Mm 3'UTR coordinates
+```{r}
+Mmensembl <- useMart(
+  host = 'https://uswest.ensembl.org', 
+  biomart = 'ENSEMBL_MART_ENSEMBL',
+  dataset = 'mmusculus_gene_ensembl'
+  )
+
+mm.ens <- read.delim("/data/reference/dawson_labs/bed_files/Mm10/Mm10EnsGene.bed", header = FALSE)
+
+Mm_utr <- getBM(
+  attributes = c('chromosome_name','3_utr_start','3_utr_end','ensembl_gene_id','external_gene_name','strand','ensembl_transcript_id'), 
+  filters = 'ensembl_gene_id',
+  values = unique(mm.ens$V4), 
+  mart = Mmensembl
+  )
+
+utrna <- Mm_utr[!is.na(Mm_utr$`3_utr_start`),]
+utrna$strand <- ifelse(utrna$strand == "-1", "-", "+")
+
+write.table(
+  utrna,
+  "reference_files/Mm10_allutr.bed",
+  sep = "\t",
+  quote = F,
+  row.names = F,
+  col.names = F
+  )
+```
+
+## now sort in terminal
+#```{bash}
+#sort -k1,1 -k2,2n Mm10_allutr.bed > Mm10_allutrsort.bed
+##bedtools merge -c 4,5,6 -o distinct,distinct,distinct -s -i Mm10_allutrsort.bed > Mm10_allutrmerge.bed
+#```
+
+```{r}
+#utr <- read.delim("reference_files/Mm10_allutrsort.bed", header = F)
+utr <- read.delim("reference_files/Mm10_allutr.bed", header = F)
+
+ens_unique <- unique(utr$V4)
+
+utr_collapse <- data.frame()
+for (l in 1:length(ens_unique)){
+  genel <- data.frame(
+    "chr" = utr[utr$V4 == ens_unique[l], "V1"][1],
+    "start" = min(utr[utr$V4 == ens_unique[l], "V2"]),
+    "end" = max(utr[utr$V4 == ens_unique[l], "V3"]),
+    "ensg" = utr[utr$V4 == ens_unique[l],"V4"][1],
+    "symbol" = utr[utr$V4 == ens_unique[l], "V5"][1],
+    "strand" = utr[utr$V4 == ens_unique[l], "V6"][1]
+    )
+  utr_collapse <- rbind(utr_collapse, genel)
+}
+
+# remove single bp utrs
+utr_collapse <- utr_collapse[-(which(utr_collapse$start >= utr_collapse$end)),]
+# remove potential problem gene
+utr_collapse <- utr_collapse[-which(utr_collapse$ensg == "ENSMUSG00000027287"),]
+
+write.table(
+  utr_collapse,
+  "reference_files/Mm10_allutrunique.bed",
+  sep = "\t",
+  quote = F,
+  row.names = F, 
+  col.names = F
+  )
+```
+
+## needs resorting
+#```{bash}
+#sort -k1,1 -k2,2n ../reference_files/Mm10_allutrunique.bed > ../reference_files/Mm10_allutruniquesort.bed 
+#```
+
+#Combine Dm6 and Mm10 utr bed files
+#```{r}
+#Mm10utr <- read.delim("reference_files/Mm10_allutrunique.bed", header = FALSE)
+#Dm6utr <- read.delim("reference_files/Dm6allutrmergechr.bed", header = FALSE)
+#Mm10Dm6utr <- rbind(Mm10utr, Dm6utr)
+#write.table(
+#  Mm10Dm6utr,
+#  "/data/reference/dawson_labs/joint_genomes/Mm38Dm6/Mm10Dm6allutrmerge.bed",
+#  sep = "\t", 
+#  quote = F,
+#  row.names = F,
+#  col.names = F
+#  )
+#```
+
+# run SLAMseq samples through SLAM-DUNK pipeline from alignment dir
+```{bash}
+cd gene_level_analysis/alignment
+
+for fq in ../../comb_fastq/*.fastq.gz
+do sbatch ../../scripts/slamdunk.sbatch $fq
+done
+```
+
+# run multiqc on fastqc and slamdunk files
+```{bash}
+# still in alignment dir to run multiqc
+module load multiqc/1.8
+multiqc .
+```
+
+### after trimming and alignments are done okay to delete combined fastqs, but leave dir as placeholder with a README
+
+# After the alignments are done there is a collapse folder with all the counts
+# Change collapse .csv files to .tsv
+```{bash}
+cd collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+```
+
+# Read in slam-dunk collapse counts files
+
+Slamdunk TCcount file format:
+col1 is ensembl ID
+col3 is RPM
+col8 is total count
+col9 is TC count
+
+# Loading and reading in files
+```{r}
+# load libraries needed
+library(edgeR)
+library(data.table)
+
+# set dirs for analysis
+project.dir <- "/dawson_genomics/Projects/METTL3i/SLAMseq/220622_A01524_0035_BHHYWMDRX2"
+align.dir <- file.path(project.dir, "alignment")
+plots.dir <- file.path(project.dir, "plots")
+session.dir <- file.path(project.dir, "session-info")
+tsv.dir <- file.path(align.dir, "collapse/tsv")
+results.dir <- file.path(project.dir, "results")
+sample.dir <- file.path(project.dir, "sample-info")
+
+setwd(project.dir)
+
+# get a list of all TCcount files
+files <- list.files(tsv.dir)
+# simplify names to use as sample names
+snames <- gsub("M3i-KK25-AT3-", "", gsub(".trim.fq_slamdunk_mapped_filtered_tcount_collapsed.tsv", "", files))
+
+# make sample annotation 
+sample.info = data.frame(
+  "files" = files, 
+  "samples" = snames, 
+  "replicate" = rep(1:3, 31)
+  )
+
+# since this is a large & complex one I am writing out basic sample ann and adding other columns then reading in
+write.table(sample.info, file.path(sample.dir, "sample_info.txt"), sep = "\t", col.names = T, row.names = F, quote = F)
+sample.info <- fread(file.path(sample.dir, "sample_info.txt"))
+# group by treatment+other conditions
+sample.info$group <- paste0(ifelse(sample.info$interferon, "IFN", "noIFN"), "_", sample.info$treatment, "_", sample.info$conditions)
+
+# make edger object from TCcounts files, use column 8 for counts and column 9 for TC counts
+counts = readDGE(
+  file = sample.info$files, 
+  path = tsv.dir, 
+  columns = c(1, 8), 
+  group = sample.info$group
+  )
+
+TCcounts = readDGE(
+  file = sample.info$files,
+  path = tsv.dir,
+  columns = c(1, 9), 
+  group = sample.info$group
+  )
+
+# cleaning up names
+rownames(counts$samples) <- snames
+rownames(TCcounts$samples) <- snames
+colnames(counts$counts) <- snames
+colnames(TCcounts$counts) <- snames
+```
+
+# write out raw counts
+```{r}
+write.table(
+  counts$counts, 
+  file.path(results.dir, "counts_raw_all.txt"),
+  sep = "\t",
+  quote = FALSE
+  )
+
+write.table(
+  TCcounts$counts, 
+  file.path(results.dir, "TCcounts_raw_all.txt"),
+  sep = "\t",
+  quote = FALSE
+  )
+```
+
+### Need to add DM_ before drosophila chromosome names in fasta for Dm genes to align properly, as these data do not need spike-in norm skipping for now
+# separate organisms counts objects and make list for looping to analyse separately until normalisation
+#```{r}
+#dros <- which(substr(rownames(counts), 1, 4) == "FBgn")
+
+#dm.counts <- counts[dros, ]
+#mm.counts <- counts[-dros, ]
+#dm.TCcounts <- TCcounts[dros, ]
+#mm.TCcounts <- TCcounts[-dros, ]
+
+#counts.obs <- list(mm.counts, mm.TCcounts, dm.counts, dm.TCcounts)
+#```
+
+# Filtering out counts of genes with low counts
+```{r}
+# make object of both edger obs for looping
+counts.obs <- list(counts, TCcounts)
+# init variable for cpms list
+cpms.list <- list()
+
+# loop through counts object, get cpms and apply same filtering to both
+for(counts.i in 1:length(counts.obs)){
+  cpms.list[[counts.i]] <- cpm(counts.obs[[counts.i]])
+  noint <- rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  # only keep those with at least 1 cpm in at least 3 samples
+  keep <- rowSums(cpms.list[[counts.i]] > 1) >= 3 & !noint
+  counts.obs[[counts.i]] <- counts.obs[[counts.i]][keep,]
+  cpms.list[[counts.i]] <- cpms.list[[counts.i]][keep,]
+}
+
+# set names for lists
+names(counts.obs) <- c("Mm_counts", "Mm_TCcounts")
+names(cpms.list) <- names(counts.obs)
+```
+
+
+# Save filtered mouse count and TC count files
+```{r}
+for(i in 1:2){
+  write.table(
+    counts.obs[[i]]$counts,
+    file.path(results.dir, paste0(names(counts.obs)[i], "_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )
+
+  write.table(
+    cpms.list[[i]],
+    file.path(results.dir, paste0(names(counts.obs)[i], "_cpms_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )  
+}
+```
+
+# set mouse filtered counts and TC counts to simplified variables
+```{r}
+counts <- counts.obs[[1]]$counts
+TCcounts <- counts.obs[[2]]$counts
+```
+
+# Plot count numbers
+```{r}
+bar.dir <- file.path(plots.dir, "barplots")
+pdf(file = file.path(bar.dir, "barplots_summary.pdf"), width = 8, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts), 
+  las = 2, 
+  main = "Total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(TCcounts), 
+  las = 2, 
+  main = "T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(TCcounts)/colSums(counts)*100, 
+  las = 2, 
+  main = "Percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+### depricated as not using spike-in
+# Plot raw drosophila reads for comparison
+#```{r}
+#pdf(file = file.path(bar.dir, "Dm_barplots_summary.pdf"), width = 8, height = 4)
+#par(mar = c(8, 5, 2, 0.2))
+#barplot(
+#  colSums(counts.obs$Dm_counts$counts), 
+#  las = 2, 
+#  main = "Dm total reads", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#barplot(
+#  colSums(counts.obs$Dm_TCcounts$counts), 
+#  las = 2, 
+#  main = "Dm TC reads", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#barplot(
+#  colSums(counts.obs$Dm_TCcounts$counts)/colSums(counts.obs$Dm_counts$counts)*100, 
+#  las = 2, 
+#  main = "Dm percentage TC", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#dev.off()
+#```
+
+
+# make table of TC%
+```{r}
+TC.table <- data.frame(
+  "sample.names" = sample.info$samples, 
+  "percent.TC" = colSums(TCcounts)/colSums(counts)*100
+  )
+TC.table
+```
+
+# add treatment and condition to DGE object samples and separate IFNvNone for easier readability
+```{r}
+counts.obs[["Mm_counts"]]$samples$treatment <- sample.info$treatment
+counts.obs[["Mm_counts"]]$samples$conditions <- sample.info$conditions
+counts.obs[["Mm_TCcounts"]]$samples$treatment <- sample.info$treatment
+counts.obs[["Mm_TCcounts"]]$samples$conditions <- sample.info$conditions
+
+mm.ifn.counts <- counts.obs[["Mm_counts"]][, sample.info$interferon == TRUE]
+mm.noifn.counts <- counts.obs[["Mm_counts"]][, sample.info$interferon == FALSE]
+mm.ifn.TCcounts <- counts.obs[["Mm_TCcounts"]][, sample.info$interferon == TRUE]
+mm.noifn.TCcounts <- counts.obs[["Mm_TCcounts"]][, sample.info$interferon == FALSE]
+
+mm.ifn.obs <- list(mm.ifn.counts, mm.noifn.counts, mm.ifn.TCcounts, mm.noifn.TCcounts)
+names(mm.ifn.obs) <- c("IFN_counts", "noIFN_counts", "IFN_TCcounts", "noIFN_TCcounts")
+```
+
+# MDS plot unnorm counts, make separate plots for IFN and noIFN
+```{r}
+library(pals)
+library(RColorBrewer)
+
+mds.dir <- file.path(plots.dir, "MDS_plots")
+
+# Setting colours, first for no IFN, coloured by conditions
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# colour by both together (group)
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$group)
+levels(col.group) <- kelly(nlevels(col.group)) 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$group)
+levels(col.group) <- kelly(nlevels(col.group)) 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+```
+
+# MDS plot unnorm TC counts, all colours too messy so just colour by cond and treatment
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts noIFN"
+  )
+dev.off()
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts IFN"
+  )
+dev.off()
+```
+
+# Use TMM as normalisation factor for full counts dataset, then apply to full TCcounts and IFN/non list as well
+```{r}
+counts.obs$Mm_counts<- calcNormFactors(counts.obs$Mm_counts, method = "TMM")
+
+counts.obs$Mm_TCcounts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors
+mm.ifn.obs$IFN_counts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == TRUE]
+mm.ifn.obs$noIFN_counts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == FALSE]
+mm.ifn.obs$IFN_TCcounts$samples$norm.factors<- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == TRUE]
+mm.ifn.obs$noIFN_TCcounts$samples$norm.factors<- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == FALSE]
+```
+
+# MDS plost as before now for normalised data 
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts noIFN"
+  )
+dev.off()
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts IFN"
+  )
+dev.off()
+```
+
+# MDS plot norm TC counts
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN"
+  )
+dev.off()
+
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN"
+  )
+dev.off()
+# also check with dim 3 to see if treatment is more of a factor
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim1_3.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(1, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim2_3.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(2, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim3_4.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(3, 4)
+  )
+dev.off()
+
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts IFN"
+  )
+dev.off()
+```
+
+# Plot normalised count numbers
+```{r}
+pdf(file = file.path(bar.dir, "barplots_TMMnormalised_summary.pdf"), width = 10, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$Mm_counts$counts) * counts.obs$Mm_counts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(counts.obs$Mm_TCcounts$counts) * counts.obs$Mm_TCcounts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  (colSums(counts.obs$Mm_TCcounts$counts)*counts.obs$Mm_TCcounts$samples$norm.factors) / (colSums(counts.obs$Mm_counts$counts)*counts.obs$Mm_counts$samples$norm.factors) * 100, 
+  las = 2, 
+  main = "Normalised percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+# look at MDS of all 93 samples together
+```{r}
+# make variable for normalised TC counts to be used in further analysis
+TCcounts.norm <- counts.obs$Mm_TCcounts
+
+col.group <- as.factor(TCcounts.norm$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_conditions.pdf"))
+MDS = plotMDS(
+  TCcounts.norm,
+  labels = TCcounts.norm$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all"
+  )
+dev.off()
+
+col.group <- as.factor(TCcounts.norm$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment.pdf"))
+MDS = plotMDS(
+  TCcounts.norm,
+  labels = TCcounts.norm$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all"
+  )
+dev.off()
+
+# now look at dims 3&4 to look for drug effect
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim1_3.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(1, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim2_3.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(2, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim3_4.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(3, 4)
+  )
+dev.off()
+```
+
+# set design and contrasts for diff analysis
+```{r}
+# design table
+design = model.matrix(~0+group, data = TCcounts.norm$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+contr.matrix <- makeContrasts(
+  noIFN_2457_4sU_30mvNone = noIFN_2457_4sU_30m - noIFN_2457_None, 
+  noIFN_2457_4sU_60mvNone = noIFN_2457_4sU_60m - noIFN_2457_None,  
+  noIFN_2457_4sU_6hvNone = noIFN_2457_4sU_6h - noIFN_2457_None,  
+  noIFN_2457_4sU_U_6hv4sU_6h = noIFN_2457_4sU_U_6h - noIFN_2457_4sU_6h, 
+  noIFN_3006_4sU_30mvNone = noIFN_3006_4sU_30m - noIFN_3006_None, 
+  noIFN_3006_4sU_60mvNone = noIFN_3006_4sU_60m - noIFN_3006_None,  
+  noIFN_3006_4sU_6hvNone = noIFN_3006_4sU_6h - noIFN_3006_None,  
+  noIFN_3006_4sU_U_6hv4sU_6h = noIFN_3006_4sU_U_6h - noIFN_3006_4sU_6h, 
+  noIFN_DMSO_4sU_30mvNone = noIFN_DMSO_4sU_30m - noIFN_DMSO_None, 
+  noIFN_DMSO_4sU_60mvNone = noIFN_DMSO_4sU_60m - noIFN_DMSO_None,  
+  noIFN_DMSO_4sU_6hvNone = noIFN_DMSO_4sU_6h - noIFN_DMSO_None,  
+  noIFN_DMSO_4sU_U_6hv4sU_6h = noIFN_DMSO_4sU_U_6h - noIFN_DMSO_4sU_6h, 
+  noIFN_4sU_30m_2457vDMSO = noIFN_2457_4sU_30m - noIFN_DMSO_4sU_30m, 
+  noIFN_4sU_60m_2457vDMSO = noIFN_2457_4sU_60m - noIFN_DMSO_4sU_60m,  
+  noIFN_4sU_6h_2457vDMSO = noIFN_2457_4sU_6h - noIFN_DMSO_4sU_6h,  
+  noIFN_4sU_U_6h_2457vDMSO = noIFN_2457_4sU_U_6h - noIFN_DMSO_4sU_U_6h, 
+  noIFN_4sU_30m_3006vDMSO = noIFN_3006_4sU_30m - noIFN_DMSO_4sU_30m, 
+  noIFN_4sU_60m_3006vDMSO = noIFN_3006_4sU_60m - noIFN_DMSO_4sU_60m,  
+  noIFN_4sU_6h_3006vDMSO = noIFN_3006_4sU_6h - noIFN_DMSO_4sU_6h,  
+  noIFN_4sU_U_6h_3006vDMSO = noIFN_3006_4sU_U_6h - noIFN_DMSO_4sU_U_6h,
+  IFN_2457_4sU_30mvNone = IFN_2457_4sU_30m - IFN_2457_None, 
+  IFN_2457_4sU_60mvNone = IFN_2457_4sU_60m - IFN_2457_None,  
+  IFN_2457_4sU_6hvNone = IFN_2457_4sU_6h - IFN_2457_None,  
+  IFN_2457_4sU_U_6hv4sU_6h = IFN_2457_4sU_U_6h - IFN_2457_4sU_6h, 
+  IFN_3006_4sU_30mvNone = IFN_3006_4sU_30m - IFN_3006_None, 
+  IFN_3006_4sU_60mvNone = IFN_3006_4sU_60m - IFN_3006_None,  
+  IFN_3006_4sU_6hvNone = IFN_3006_4sU_6h - IFN_3006_None,  
+  IFN_3006_4sU_U_6hv4sU_6h = IFN_3006_4sU_U_6h - IFN_3006_4sU_6h, 
+  IFN_DMSO_4sU_30mvNone = IFN_DMSO_4sU_30m - IFN_DMSO_None, 
+  IFN_DMSO_4sU_60mvNone = IFN_DMSO_4sU_60m - IFN_DMSO_None,  
+  IFN_DMSO_4sU_6hvNone = IFN_DMSO_4sU_6h - IFN_DMSO_None,  
+  IFN_DMSO_4sU_U_6hv4sU_6h = IFN_DMSO_4sU_U_6h - IFN_DMSO_4sU_6h, 
+  IFN_4sU_30m_2457vDMSO = IFN_2457_4sU_30m - IFN_DMSO_4sU_30m, 
+  IFN_4sU_60m_2457vDMSO = IFN_2457_4sU_60m - IFN_DMSO_4sU_60m,  
+  IFN_4sU_6h_2457vDMSO = IFN_2457_4sU_6h - IFN_DMSO_4sU_6h,  
+  IFN_4sU_U_6h_2457vDMSO = IFN_2457_4sU_U_6h - IFN_DMSO_4sU_U_6h, 
+  IFN_4sU_30m_3006vDMSO = IFN_3006_4sU_30m - IFN_DMSO_4sU_30m, 
+  IFN_4sU_60m_3006vDMSO = IFN_3006_4sU_60m - IFN_DMSO_4sU_60m,  
+  IFN_4sU_6h_3006vDMSO = IFN_3006_4sU_6h - IFN_DMSO_4sU_6h,  
+  IFN_4sU_U_6h_3006vDMSO = IFN_3006_4sU_U_6h - IFN_DMSO_4sU_U_6h,
+  levels = design
+  )
+contr.matrix
+```
+
+# make gene ann file from gtf at gene level
+```{r}
+library(Rsubread)
+
+mm10.gff.name <- flattenGTF(
+    "/data/reference/gtf/Mus_musculus.GRCm38.90.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "gene_name",
+    method = "merge"
+    )
+
+# get gene ids and make new ref for new project
+mm10.gff.gene <- flattenGTF(
+    "/data/reference/gtf/Mus_musculus.GRCm38.90.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "gene_id",
+    method = "merge"
+    )
+
+gene.ann <- merge(
+  mm10.gff.gene, 
+  mm10.gff.name, 
+  by.x = c("Chr", "Start", "End", "Strand"), 
+  by.y = c("Chr", "Start", "End", "Strand"),
+  all.x = TRUE
+  )
+colnames(gene.ann)[5:6] <- c("ENSMUSG", "Symbol")
+
+# collapse duplicates
+ens_unique <- unique(gene.ann$ENSMUSG)
+
+ann_collapse <- data.frame()
+for (l in 1:length(ens_unique)){
+  genel <- data.frame(
+    "Chr" = gene.ann[gene.ann$ENSMUSG == ens_unique[l], "Chr"][1],
+    "Start" = min(gene.ann[gene.ann$ENSMUSG == ens_unique[l], "Start"]),
+    "End" = max(gene.ann[gene.ann$ENSMUSG == ens_unique[l], "End"]),
+    "Strand" = gene.ann[gene.ann$ENSMUSG == ens_unique[l],"Strand"][1],
+    "ENSMUSG" = gene.ann[gene.ann$ENSMUSG == ens_unique[l], "ENSMUSG"][1],
+    "Symbol" = gene.ann[gene.ann$ENSMUSG == ens_unique[l], "Symbol"][1]
+    )
+  ann_collapse <- rbind(ann_collapse, genel)
+}
+
+gene.ann <- ann_collapse
+
+# write out to refs
+write.table(
+  gene.ann,
+  "reference_files/mm10_ENSMUSG_symbol_ann.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+
+# DE with edger
+```{r}
+# set dir for edger results
+edger.dir <- file.path(results.dir, "edger")
+#e stimate dispersion
+TCcounts.disp <- estimateDisp(TCcounts.norm, design)
+# get glm fit
+gfit <- glmQLFit(TCcounts.disp, design)
+# make empty list for ftest results
+ftest.list <- list()
+# loop through each contrast run ftest and write out results
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  # get ftest results and save to list named for contrast
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[ , contrast.i])
+  # remove 3utr from ensembl gene IDs
+  rownames(ftest.list[[contrast.i]]$table) <- gsub("_3utr", "", rownames(ftest.list[[contrast.i]]$table))
+  # add column for ens id
+  ftest.list[[contrast.i]]$table$ensg <- rownames(ftest.list[[contrast.i]]$table)
+  # merge with ann file on ens id
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, gene.ann, by.x = "ensg", by.y = "ENSMUSG")
+  # sort by pval
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$PValue), ]
+  # write ftest table
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_TCcounts_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+
+# add names for referencing
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+# MA plots
+```{r}
+# set and create dir for MA plots
+edger.ma.dir <- file.path(plots.dir, "edger_MAplots")
+dir.create(edger.ma.dir)
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  pdf(file.path(edger.ma.dir, paste0(colnames(contr.matrix)[contrast.i], "_MAplot.pdf")))
+  maPlot(
+    logAbundance = ftest.list[[contrast.i]]$table$logCPM,
+    logFC = ftest.list[[contrast.i]]$table$logFC,
+    main = colnames(contr.matrix)[contrast.i],
+    xlab = expression(bold(paste("log"[2], " CPM"))),
+    ylab = expression(bold(paste("log"[2], " FC"))),
+    col = "black",
+    allCol ="red",
+    lowess = T
+  )
+  dev.off()
+}
+```
+
+# make volcano plots for each comparison
+```{r}
+library(EnhancedVolcano)
+library(grDevices)
+vol.dir <- file.path(plots.dir, "volcano_plots")
+dir.create(vol.dir.dir)
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  pdf(file.path(vol.dir, paste0(colnames(contr.matrix)[contrast.i], "_volcano_plot.pdf")))
+  EnhancedVolcano(
+    ftest.list[[contrast.i]]$table,
+    lab = ftest.list[[contrast.i]]$table$Symbol,
+    x = "logFC",
+    y = "PValue",
+    title = colnames(contr.matrix)[contrast.i],
+    drawConnectors = TRUE,
+    widthConnectors = 0.75
+    )
+  dev.off()
+}
+```
+
+# label genes of interest on endpoint drugvDMSO volcanos
+```{r}
+# set variable for stability comparisons to loop through
+stab.comp <- c("noIFN_4sU_U_6h_2457vDMSO", "noIFN_4sU_U_6h_3006vDMSO", "IFN_4sU_U_6h_2457vDMSO", "IFN_4sU_U_6h_3006vDMSO")
+# set variable for genes of interest
+goi <- c("Calr", "Pdia3", "Isg15", "H2-K1")
+
+for(contrast.i in 1:length(stab.comp)){
+  comp.name <- stab.comp[contrast.i]
+  pdf(file.path(vol.dir, paste0(comp.name, "_volcano_plot.pdf")))
+  EnhancedVolcano(
+    ftest.list[[comp.name]]$table,
+    lab = ftest.list[[comp.name]]$table$Symbol,
+    x = "logFC",
+    y = "PValue",
+    title = comp.name,
+    drawConnectors = TRUE,
+    widthConnectors = 0.75
+    )
+  dev.off()
+  contrast.i <- contrast.i +1
+}
+```
+
+# find genes sig down in DMSO_4sU_Uv4sU, not sig down in DRUG_4sU_Uv4sU
+```{r}
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+
+# get each set of genes that are significantly down 
+noifn2457 <- ftest.list[["noIFN_2457_4sU_U_6hv4sU_6h"]]$table
+noifn2457 <- noifn2457[which(noifn2457$PValue < 10e-6 & noifn2457$logFC < 0), c("ensg", "Symbol")]
+noifn3006 <- ftest.list[["noIFN_3006_4sU_U_6hv4sU_6h"]]$table
+noifn3006 <- noifn3006[which(noifn3006$PValue < 10e-6 & noifn3006$logFC < 0), c("ensg", "Symbol")]
+noifnDMSO <- ftest.list[["noIFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+noifnDMSO <- noifnDMSO[which(noifnDMSO$PValue < 10e-6 & noifnDMSO$logFC < 0), c("ensg", "Symbol")]
+ifn2457 <- ftest.list[["IFN_2457_4sU_U_6hv4sU_6h"]]$table
+ifn2457 <- ifn2457[which(ifn2457$PValue < 10e-6 & ifn2457$logFC < 0), c("ensg", "Symbol")]
+ifn3006 <- ftest.list[["IFN_3006_4sU_U_6hv4sU_6h"]]$table
+ifn3006 <- ifn3006[which(ifn3006$PValue < 10e-6 & ifn3006$logFC < 0), c("ensg", "Symbol")]
+ifnDMSO <- ftest.list[["IFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+ifnDMSO <- ifnDMSO[which(ifnDMSO$PValue < 10e-6 & ifnDMSO$logFC < 0), c("ensg", "Symbol")]
+
+# get those down in dmso only as "drug-stabilised
+noifn2457.stab <- anti_join(noifnDMSO, noifn2457)
+noifn3006.stab <- anti_join(noifnDMSO, noifn3006)
+ifn2457.stab <- anti_join(ifnDMSO, ifn2457)
+ifn3006.stab <- anti_join(ifnDMSO, ifn3006)
+
+# combine into single list of "drug-stabilised" genes
+drug.stab <- unique(rbind(noifn2457.stab, noifn3006.stab, ifn2457.stab, ifn3006.stab))
+
+# get normalised cpms
+norm.cpm <- cpm(counts.obs$Mm_TCcounts, normalized.lib.sizes = TRUE)
+# create matrix for heatmap: CPMs of 36 replicates from above comparisons and limit to drug.stab ENS IDs
+norm.cpm <- norm.cpm[, grepl("6hr", colnames(norm.cpm))]
+# remove "_3utr from counts to match properly
+rownames(norm.cpm) <- gsub("_3utr", "", rownames(norm.cpm))
+norm.cpm <- norm.cpm[drug.stab$ensg,]
+# replace ensg with symbols as rownames for heatmap
+rownames(norm.cpm) <- drug.stab$Symbol
+# filter out < 1 cpm in all samples and log transform for readbility
+keep <- rowMeans(norm.cpm) > 10
+norm.cpm.filter <- norm.cpm[keep,]
+norm.cpm.filter.log <- log2(1 + norm.cpm.filter)
+
+# make matrix
+heat.mat <- as.matrix(norm.cpm.filter.log)
+
+# heatmap of cpms for gene set
+pdf(file.path(plots.dir, "Heatmap_drug_stabilised_genes_ENSMUSG.pdf"))
+Heatmap(heat.mat, use_raster = FALSE, column_names_gp = gpar(fontsize = 5), row_names_gp = gpar(fontsize = 4))
+dev.off()
+
+# get heatmap row order to get hm genes in order to send as list
+hm.list <- draw(Heatmap(heat.mat))
+gene.order <- rownames(heat.mat)[row_order(hm.list)]
+write.table(
+  gene.order,
+  file.path(plots.dir, "Heatmap_drug_stabilised_genes_HMordered_list.txt"),
+  sep = "\n",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+
+# examine isoform level analylsis as well
+```{bash}
+cd isoform_analysis/alignment
+
+for fq in ../../alignment/fastq/*trim.fq.gz
+do sbatch ../../scripts/iso_slamdunk.sbatch $fq
+done
+```
+
+# Change collapse .csv files to .tsv
+```{bash}
+cd collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+```
+
+# Read in slam-dunk collapse counts files
+
+Slamdunk TCcount file format:
+col1 is ensembl ID
+col3 is RPM
+col8 is total count
+col9 is TC count
+
+# Loading and reading in files
+```{r}
+# set dirs for analysis
+iso.dir <- file.path(project.dir, "isoform_analysis")
+iso.align.dir <- file.path(iso.dir, "alignment")
+iso.plots.dir <- file.path(iso.dir, "plots")
+iso.tsv.dir <- file.path(iso.align.dir, "collapse/tsv")
+iso.results.dir <- file.path(iso.dir, "results")
+
+setwd(iso.dir)
+
+# get a list of all TCcount files
+files <- list.files(iso.tsv.dir)
+# simplify names to use as sample names
+snames <- gsub("M3i-KK25-AT3-", "", gsub(".trim.fq_slamdunk_mapped_filtered_tcount_collapsed.tsv", "", files))
+
+# make edger object from TCcounts files, use column 8 for counts and column 9 for TC counts
+counts = readDGE(
+  file = sample.info$files, 
+  path = iso.tsv.dir, 
+  columns = c(1, 8), 
+  group = sample.info$group
+  )
+
+TCcounts = readDGE(
+  file = sample.info$files,
+  path = iso.tsv.dir,
+  columns = c(1, 9), 
+  group = sample.info$group
+  )
+
+# cleaning up names
+rownames(counts$samples) <- snames
+rownames(TCcounts$samples) <- snames
+colnames(counts$counts) <- snames
+colnames(TCcounts$counts) <- snames
+```
+
+# write out raw counts
+```{r}
+write.table(
+  counts$counts, 
+  file.path(iso.results.dir, "counts_raw_all.txt"),
+  sep = "\t",
+  quote = FALSE
+  )
+
+write.table(
+  TCcounts$counts, 
+  file.path(iso.results.dir, "TCcounts_raw_all.txt"),
+  sep = "\t",
+  quote = FALSE
+  )
+```
+
+### Need to add DM_ before drosophila chromosome names in fasta for Dm genes to align properly, as these data do not need spike-in norm skipping for now
+# separate organisms counts objects and make list for looping to analyse separately until normalisation
+#```{r}
+#dros <- which(substr(rownames(counts), 1, 4) == "FBgn")
+
+#dm.counts <- counts[dros, ]
+#mm.counts <- counts[-dros, ]
+#dm.TCcounts <- TCcounts[dros, ]
+#mm.TCcounts <- TCcounts[-dros, ]
+
+#counts.obs <- list(mm.counts, mm.TCcounts, dm.counts, dm.TCcounts)
+#```
+
+# Filtering out counts of genes with low counts
+```{r}
+# make object of both edger obs for looping
+counts.obs <- list(counts, TCcounts)
+# init variable for cpms list
+cpms.list <- list()
+
+# loop through counts object, get cpms and apply same filtering to both
+for(counts.i in 1:length(counts.obs)){
+  cpms.list[[counts.i]] <- cpm(counts.obs[[counts.i]])
+  noint <- rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  # only keep those with at least 1 cpm in at least 3 samples
+  keep <- rowSums(cpms.list[[counts.i]] > 1) >= 3 & !noint
+  counts.obs[[counts.i]] <- counts.obs[[counts.i]][keep,]
+  cpms.list[[counts.i]] <- cpms.list[[counts.i]][keep,]
+}
+
+# set names for lists
+names(counts.obs) <- c("Mm_counts", "Mm_TCcounts")
+names(cpms.list) <- names(counts.obs)
+```
+
+
+# Save filtered mouse count and TC count files
+```{r}
+for(i in 1:2){
+  write.table(
+    counts.obs[[i]]$counts,
+    file.path(iso.results.dir, paste0(names(counts.obs)[i], "_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )
+
+  write.table(
+    cpms.list[[i]],
+    file.path(iso.results.dir, paste0(names(counts.obs)[i], "_cpms_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )  
+}
+```
+
+# set mouse filtered counts and TC counts to simplified variables
+```{r}
+counts <- counts.obs[[1]]$counts
+TCcounts <- counts.obs[[2]]$counts
+```
+
+# Plot count numbers
+```{r}
+bar.dir <- file.path(iso.plots.dir, "barplots")
+pdf(file = file.path(bar.dir, "barplots_summary.pdf"), width = 8, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts), 
+  las = 2, 
+  main = "Total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(TCcounts), 
+  las = 2, 
+  main = "T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(TCcounts)/colSums(counts)*100, 
+  las = 2, 
+  main = "Percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+### depricated as not using spike-in
+# Plot raw drosophila reads for comparison
+#```{r}
+#pdf(file = file.path(bar.dir, "Dm_barplots_summary.pdf"), width = 8, height = 4)
+#par(mar = c(8, 5, 2, 0.2))
+#barplot(
+#  colSums(counts.obs$Dm_counts$counts), 
+#  las = 2, 
+#  main = "Dm total reads", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#barplot(
+#  colSums(counts.obs$Dm_TCcounts$counts), 
+#  las = 2, 
+#  main = "Dm TC reads", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#barplot(
+#  colSums(counts.obs$Dm_TCcounts$counts)/colSums(counts.obs$Dm_counts$counts)*100, 
+#  las = 2, 
+#  main = "Dm percentage TC", 
+#  names.arg = sample.info$samples,
+#  col = c("coral1", "darkslategray3", "mediumpurple3"),
+#  cex.names = 0.4
+#  )
+#dev.off()
+#```
+
+
+# make table of TC%
+```{r}
+TC.table <- data.frame(
+  "sample.names" = sample.info$samples, 
+  "percent.TC" = colSums(TCcounts)/colSums(counts)*100
+  )
+TC.table
+```
+
+# add treatment and condition to DGE object samples and separate IFNvNone for easier readability
+```{r}
+counts.obs[["Mm_counts"]]$samples$treatment <- sample.info$treatment
+counts.obs[["Mm_counts"]]$samples$conditions <- sample.info$conditions
+counts.obs[["Mm_TCcounts"]]$samples$treatment <- sample.info$treatment
+counts.obs[["Mm_TCcounts"]]$samples$conditions <- sample.info$conditions
+
+mm.ifn.counts <- counts.obs[["Mm_counts"]][, sample.info$interferon == TRUE]
+mm.noifn.counts <- counts.obs[["Mm_counts"]][, sample.info$interferon == FALSE]
+mm.ifn.TCcounts <- counts.obs[["Mm_TCcounts"]][, sample.info$interferon == TRUE]
+mm.noifn.TCcounts <- counts.obs[["Mm_TCcounts"]][, sample.info$interferon == FALSE]
+
+mm.ifn.obs <- list(mm.ifn.counts, mm.noifn.counts, mm.ifn.TCcounts, mm.noifn.TCcounts)
+names(mm.ifn.obs) <- c("IFN_counts", "noIFN_counts", "IFN_TCcounts", "noIFN_TCcounts")
+```
+
+# MDS plot unnorm counts, make separate plots for IFN and noIFN
+```{r}
+mds.dir <- file.path(iso.plots.dir, "MDS_plots")
+
+# Setting colours, first for no IFN, coloured by conditions
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# colour by both together (group)
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$group)
+levels(col.group) <- kelly(nlevels(col.group)) 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_noIFN.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts noIFN"
+  )
+dev.off()
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$group)
+levels(col.group) <- kelly(nlevels(col.group)) 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_counts_IFN.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts IFN"
+  )
+dev.off()
+```
+
+# MDS plot unnorm TC counts, all colours too messy so just colour by cond and treatment
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts noIFN"
+  )
+dev.off()
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_unnorm_TCcounts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised T>C counts IFN"
+  )
+dev.off()
+```
+
+# Use TMM as normalisation factor for full counts dataset, then apply to full TCcounts and IFN/non list as well
+```{r}
+counts.obs$Mm_counts<- calcNormFactors(counts.obs$Mm_counts, method = "TMM")
+
+counts.obs$Mm_TCcounts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors
+mm.ifn.obs$IFN_counts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == TRUE]
+mm.ifn.obs$noIFN_counts$samples$norm.factors <- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == FALSE]
+mm.ifn.obs$IFN_TCcounts$samples$norm.factors<- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == TRUE]
+mm.ifn.obs$noIFN_TCcounts$samples$norm.factors<- counts.obs$Mm_counts$samples$norm.factors[sample.info$interferon == FALSE]
+```
+
+# MDS plost as before now for normalised data 
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts noIFN"
+  )
+dev.off()
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_counts"]],
+  labels = mm.ifn.obs[["noIFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts noIFN"
+  )
+dev.off()
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_counts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_counts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_counts"]],
+  labels = mm.ifn.obs[["IFN_counts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts IFN"
+  )
+dev.off()
+```
+
+# MDS plot norm TC counts
+```{r}
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN"
+  )
+dev.off()
+
+# now colour by treatment
+col.group <- as.factor(mm.ifn.obs[["noIFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN"
+  )
+dev.off()
+# also check with dim 3 to see if treatment is more of a factor
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim1_3.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(1, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim2_3.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(2, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_noIFN_treatment_dim3_4.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["noIFN_TCcounts"]],
+  labels = mm.ifn.obs[["noIFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts noIFN", 
+  dim.plot = c(3, 4)
+  )
+dev.off()
+
+
+# now same for IFN samples
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_IFN_conditions.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts IFN"
+  )
+dev.off()
+
+col.group <- as.factor(mm.ifn.obs[["IFN_TCcounts"]]$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_IFN_treatment.pdf"))
+MDS = plotMDS(
+  mm.ifn.obs[["IFN_TCcounts"]],
+  labels = mm.ifn.obs[["IFN_TCcounts"]]$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts IFN"
+  )
+dev.off()
+```
+
+# Plot normalised count numbers
+```{r}
+pdf(file = file.path(bar.dir, "barplots_TMMnormalised_summary.pdf"), width = 10, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$Mm_counts$counts) * counts.obs$Mm_counts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(counts.obs$Mm_TCcounts$counts) * counts.obs$Mm_TCcounts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  (colSums(counts.obs$Mm_TCcounts$counts)*counts.obs$Mm_TCcounts$samples$norm.factors) / (colSums(counts.obs$Mm_counts$counts)*counts.obs$Mm_counts$samples$norm.factors) * 100, 
+  las = 2, 
+  main = "Normalised percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+# look at MDS of all 93 samples together
+```{r}
+# make variable for normalised TC counts to be used in further analysis
+TCcounts.norm <- counts.obs$Mm_TCcounts
+
+col.group <- as.factor(TCcounts.norm$samples$conditions)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1")
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_conditions.pdf"))
+MDS = plotMDS(
+  TCcounts.norm,
+  labels = TCcounts.norm$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all"
+  )
+dev.off()
+
+col.group <- as.factor(TCcounts.norm$samples$treatment)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment.pdf"))
+MDS = plotMDS(
+  TCcounts.norm,
+  labels = TCcounts.norm$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all"
+  )
+dev.off()
+
+# now look at dims 3&4 to look for drug effect
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim1_3.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(1, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim2_3.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(2, 3)
+  )
+dev.off()
+pdf(file.path(mds.dir, "MDS_Mm_TMMnorm_TCcounts_all_treatment_dim3_4.pdf"))
+MDS = plotMDS(
+  counts.obs$Mm_TCcounts,
+  labels = counts.obs$Mm_TCcounts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised T>C counts all", 
+  dim.plot = c(3, 4)
+  )
+dev.off()
+```
+
+# make tx level ann file
+```{r}
+library(annotatr)
+
+mm10.ann <- build_annotations(genome = 'mm10', annotations = "mm10_genes_3UTRs")
+mm10.utr <- data.frame(mm10.ann)
+enst.sym <- cbind(substr(mm10.utr$tx_id, 1, 18), mm10.utr$symbol)
+colnames(enst.sym) <- c("enst", "symbol")
+enst.sym <- unique(enst.sym)
+```
+
+# DE with edger
+```{r}
+# set dir for edger results
+edger.dir <- file.path(iso.results.dir, "edger")
+#e stimate dispersion
+TCcounts.disp <- estimateDisp(TCcounts.norm, design)
+# get glm fit
+gfit <- glmQLFit(TCcounts.disp, design)
+# make empty list for ftest results
+ftest.list <- list()
+# loop through each contrast run ftest and write out results
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  # get ftest results and save to list named for contrast
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[ , contrast.i])
+  # remove 3utr from ensembl gene IDs
+  rownames(ftest.list[[contrast.i]]$table) <- gsub("_3utr", "", rownames(ftest.list[[contrast.i]]$table))
+  # add column for ens id
+  ftest.list[[contrast.i]]$table$enst <- rownames(ftest.list[[contrast.i]]$table)
+  # merge with ann file on ens id
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, enst.sym, by.x = "enst", by.y = "enst", all.x = TRUE)
+  # sort by pval
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$PValue), ]
+  # write ftest table
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_TCcounts_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+
+# add names for referencing
+names(ftest.list) <- colnames(contr.matrix)
+```
+
+# MA plots
+```{r}
+# set and create dir for MA plots
+edger.ma.dir <- file.path(iso.plots.dir, "edger_MAplots")
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  pdf(file.path(edger.ma.dir, paste0(colnames(contr.matrix)[contrast.i], "_MAplot.pdf")))
+  maPlot(
+    logAbundance = ftest.list[[contrast.i]]$table$logCPM,
+    logFC = ftest.list[[contrast.i]]$table$logFC,
+    main = colnames(contr.matrix)[contrast.i],
+    xlab = expression(bold(paste("log"[2], " CPM"))),
+    ylab = expression(bold(paste("log"[2], " FC"))),
+    col = "black",
+    allCol ="red",
+    lowess = T
+  )
+  dev.off()
+}
+```
+
+# make volcano plots for each comparison
+```{r}
+vol.dir <- file.path(iso.plots.dir, "volcano_plots")
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  pdf(file.path(vol.dir, paste0(colnames(contr.matrix)[contrast.i], "_volcano_plot.pdf")))
+  EnhancedVolcano(
+    ftest.list[[contrast.i]]$table,
+    lab = ftest.list[[contrast.i]]$table$symbol,
+    x = "logFC",
+    y = "PValue",
+    title = colnames(contr.matrix)[contrast.i],
+    drawConnectors = TRUE,
+    widthConnectors = 0.75
+    )
+  dev.off()
+}
+```
+
+# redo bar plots per Andrew's requests (separating early timepoints from longer and reordering)
+```{r}
+# set order for early timepoints, then plot
+early.order <- c(61:69, 1:9, 31:39, 76:84, 16:24, 46:54)
+pdf(file = file.path(bar.dir, "barplots_TMMnorm_TCcounts_early.pdf"), width = 10, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$Mm_TCcounts$counts)[early.order] * counts.obs$Mm_TCcounts$samples$norm.factors[early.order], 
+  las = 2, 
+  main = "TMM Normalised T>C reads at early timepoints", 
+  names.arg = sample.info$samples[early.order],
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+
+# now same for late timepoints
+late.order <- c(70:75, 10:15, 40:45, 85:90, 25:30, 55:60)
+pdf(file = file.path(bar.dir, "barplots_TMMnorm_TCcounts_late.pdf"), width = 10, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$Mm_TCcounts$counts)[late.order] * counts.obs$Mm_TCcounts$samples$norm.factors[late.order], 
+  las = 2, 
+  main = "TMM Normalised T>C reads at late timepoints", 
+  names.arg = sample.info$samples[late.order],
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+# label genes of interest on endpoint drugvDMSO volcanos
+```{r}
+# set variable for stability comparisons to loop through
+stab.comp <- c("noIFN_4sU_U_6h_2457vDMSO", "noIFN_4sU_U_6h_3006vDMSO", "IFN_4sU_U_6h_2457vDMSO", "IFN_4sU_U_6h_3006vDMSO")
+# set variable for genes of interest
+goi <- c("Calr", "Pdia3", "Isg15", "H2-K1")
+
+for(contrast.i in 1:length(stab.comp)){
+  comp.name <- stab.comp[contrast.i]
+  pdf(file.path(vol.dir, paste0(comp.name, "_volcano_plot.pdf")))
+  EnhancedVolcano(
+    ftest.list[[comp.name]]$table,
+    lab = ftest.list[[comp.name]]$table$symbol,
+    selectLab = goi,
+    x = "logFC",
+    y = "PValue",
+    title = comp.name,
+    drawConnectors = TRUE,
+    widthConnectors = 0.75
+    )
+  dev.off()
+}
+```
+
+# make correlation plots of stab.comps
+```{r}
+scatter.dir <- file.path(iso.plots.dir, "scatterplots")
+
+pdf(file.path(scatter.dir, "noIFN_4sU_U_6h_2457vDMSO_TMMnorm_reads_scatter.pdf"), height = 8, width = 8)
+plot(
+  rowMeans(counts.obs$Mm_TCcounts$counts[,73:75] * counts.obs$Mm_TCcounts$samples$norm.factors[73:75]),
+  rowMeans(counts.obs$Mm_TCcounts$counts[,13:15] * counts.obs$Mm_TCcounts$samples$norm.factors[13:15]), 
+  col = rgb(0, 100, 0, 50, maxColorValue = 255), 
+  pch = 16, 
+  cex = 1.1, 
+  xlab = "noIFN_DMSO_4sU_U_6h", 
+  ylab = "noIFN_2457_4sU_U_6h",
+  xlim = c(0, 15000),
+  ylim = c(0, 15000)
+  )
+abline(a = 0, b = 1, col = "dodgerblue")
+dev.off()
+
+pdf(file.path(scatter.dir, "noIFN_4sU_U_6h_3006vDMSO_TMMnorm_reads_scatter.pdf"), height = 8, width = 8)
+plot(
+  rowMeans(counts.obs$Mm_TCcounts$counts[,73:75] * counts.obs$Mm_TCcounts$samples$norm.factors[73:75]),
+  rowMeans(counts.obs$Mm_TCcounts$counts[,43:45] * counts.obs$Mm_TCcounts$samples$norm.factors[43:45]), 
+  col = rgb(0, 100, 0, 50, maxColorValue = 255), 
+  pch = 16, 
+  cex = 1.1, 
+  xlab = "noIFN_DMSO_4sU_U_6h", 
+  ylab = "noIFN_3006_4sU_U_6h",
+  xlim = c(0, 15000),
+  ylim = c(0, 15000)
+  )
+abline(a = 0, b = 1, col = "dodgerblue")
+dev.off()
+
+pdf(file.path(scatter.dir, "IFN_4sU_U_6h_2457vDMSO_TMMnorm_reads_scatter.pdf"), height = 8, width = 8)
+plot(
+  rowMeans(counts.obs$Mm_TCcounts$counts[,88:90] * counts.obs$Mm_TCcounts$samples$norm.factors[88:90]),
+  rowMeans(counts.obs$Mm_TCcounts$counts[,28:30] * counts.obs$Mm_TCcounts$samples$norm.factors[28:30]), 
+  col = rgb(0, 100, 0, 50, maxColorValue = 255), 
+  pch = 16, 
+  cex = 1.1, 
+  xlab = "IFN_DMSO_4sU_U_6h", 
+  ylab = "IFN_2457_4sU_U_6h",
+  xlim = c(0, 15000),
+  ylim = c(0, 15000)
+  )
+abline(a = 0, b = 1, col = "dodgerblue")
+dev.off()
+
+pdf(file.path(scatter.dir, "IFN_4sU_U_6h_3006vDMSO_TMMnorm_reads_scatter.pdf"), height = 8, width = 8)
+plot(
+  rowMeans(counts.obs$Mm_TCcounts$counts[,88:90] * counts.obs$Mm_TCcounts$samples$norm.factors[88:90]),
+  rowMeans(counts.obs$Mm_TCcounts$counts[,58:60] * counts.obs$Mm_TCcounts$samples$norm.factors[58:60]), 
+  col = rgb(0, 100, 0, 50, maxColorValue = 255), 
+  pch = 16, 
+  cex = 1.1, 
+  xlab = "IFN_DMSO_4sU_U_6h", 
+  ylab = "IFN_3006_4sU_U_6h",
+  xlim = c(0, 15000),
+  ylim = c(0, 15000)
+  )
+abline(a = 0, b = 1, col = "dodgerblue")
+dev.off()
+```
+
+# find genes sig down in DMSO_4sU_Uv4sU, not sig down in DRUG_4sU_Uv4sU
+```{r}
+# get each set of genes that are significantly down 
+noifn2457 <- ftest.list[["noIFN_2457_4sU_U_6hv4sU_6h"]]$table
+noifn2457 <- noifn2457[which(noifn2457$PValue < 10e-6 & noifn2457$logFC < 0), c("enst", "symbol")]
+noifn3006 <- ftest.list[["noIFN_3006_4sU_U_6hv4sU_6h"]]$table
+noifn3006 <- noifn3006[which(noifn3006$PValue < 10e-6 & noifn3006$logFC < 0), c("enst", "symbol")]
+noifnDMSO <- ftest.list[["noIFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+noifnDMSO <- noifnDMSO[which(noifnDMSO$PValue < 10e-6 & noifnDMSO$logFC < 0), c("enst", "symbol")]
+ifn2457 <- ftest.list[["IFN_2457_4sU_U_6hv4sU_6h"]]$table
+ifn2457 <- ifn2457[which(ifn2457$PValue < 10e-6 & ifn2457$logFC < 0), c("enst", "symbol")]
+ifn3006 <- ftest.list[["IFN_3006_4sU_U_6hv4sU_6h"]]$table
+ifn3006 <- ifn3006[which(ifn3006$PValue < 10e-6 & ifn3006$logFC < 0), c("enst", "symbol")]
+ifnDMSO <- ftest.list[["IFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+ifnDMSO <- ifnDMSO[which(ifnDMSO$PValue < 10e-6 & ifnDMSO$logFC < 0), c("enst", "symbol")]
+
+# get those down in dmso only as "drug-stabilised"
+noifn2457.stab <- anti_join(noifnDMSO, noifn2457)
+noifn3006.stab <- anti_join(noifnDMSO, noifn3006)
+ifn2457.stab <- anti_join(ifnDMSO, ifn2457)
+ifn3006.stab <- anti_join(ifnDMSO, ifn3006)
+
+# combine into single list of "drug-stabilised" genes
+drug.stab <- unique(rbind(noifn2457.stab, noifn3006.stab, ifn2457.stab, ifn3006.stab))
+
+# get normalised cpms
+norm.cpm <- cpm(counts.obs$Mm_TCcounts, normalized.lib.sizes = TRUE)
+# create matrix for heatmap: CPMs of 36 replicates from above comparisons and limit to drug.stab ENS IDs
+norm.cpm <- norm.cpm[, grepl("6hr", colnames(norm.cpm))]
+# remove "_3utr from counts to match properly
+rownames(norm.cpm) <- gsub("_3utr", "", rownames(norm.cpm))
+norm.cpm <- norm.cpm[drug.stab$enst,]
+# replace ensg with symbols as rownames for heatmap
+rownames(norm.cpm) <- drug.stab$symbol
+# filter out < 1 cpm in all samples and log transform for readbility
+keep <- rowMeans(norm.cpm) > 10
+norm.cpm.filter <- norm.cpm[keep,]
+norm.cpm.filter.log <- log2(1 + norm.cpm.filter)
+
+# make matrix
+heat.mat <- as.matrix(norm.cpm.filter.log)
+
+# heatmap of cpms for gene set
+pdf(file.path(iso.plots.dir, "Heatmap_drug_stabilised_genes.pdf"))
+Heatmap(heat.mat, use_raster = FALSE, column_names_gp = gpar(fontsize = 5), row_names_gp = gpar(fontsize = 0.5))
+dev.off()
+
+# get heatmap row order to get hm genes in order to send as list
+hm.list <- draw(Heatmap(heat.mat))
+gene.order <- rownames(heat.mat)[row_order(hm.list)]
+write.table(
+  gene.order,
+  file.path(plots.dir, "Heatmap_drug_stabilised_genes_HMordered_list.txt"),
+  sep = "\n",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make barplot to show global changes in T>C
+```{r}
+library(ggpubr)
+
+# get total counts for each sample
+norm.sums <- colSums(counts.obs$Mm_TCcounts$counts) * counts.obs$Mm_TCcounts$samples$norm.factors
+# get mean across replicates
+rep.mean <- cbind(
+  "DMSO" = mean(norm.sums[61:63]),
+  "DMSO_IFN" = mean(norm.sums[76:78]),
+  "DMSO_4sU_30m" = mean(norm.sums[64:66]),
+  "DMSO_IFN_4sU_30m" = mean(norm.sums[79:81]),
+  "DMSO_4sU_60m" = mean(norm.sums[67:69]),
+  "DMSO_IFN_4sU_60m" = mean(norm.sums[82:84]),
+  "2457" = mean(norm.sums[1:3]),
+  "2457_IFN" = mean(norm.sums[16:18]),
+  "2457_4sU_30m" = mean(norm.sums[4:6]),
+  "2457_IFN_4sU_30m" = mean(norm.sums[19:21]),
+  "2457_4sU_60m" = mean(norm.sums[7:9]),
+  "2457_IFN_4sU_60m" = mean(norm.sums[22:24]),
+  "3006" = mean(norm.sums[31:33]),
+  "3006_IFN" = mean(norm.sums[46:48]),
+  "3006_4sU_30m" = mean(norm.sums[34:36]),
+  "3006_IFN_4sU_30m" = mean(norm.sums[49:51]),
+  "3006_4sU_60m" = mean(norm.sums[37:39]),
+  "3006_IFN_4sU_60m" = mean(norm.sums[52:54])
+  )
+# get sd across replicates
+rep.sd <- cbind(
+  "DMSO" = sd(norm.sums[61:63]),
+  "DMSO_IFN" = sd(norm.sums[76:78]),
+  "DMSO_4sU_30m" = sd(norm.sums[64:66]),
+  "DMSO_IFN_4sU_30m" = sd(norm.sums[79:81]),
+  "DMSO_4sU_60m" = sd(norm.sums[67:69]),
+  "DMSO_IFN_4sU_60m" = sd(norm.sums[82:84]),
+  "2457" = sd(norm.sums[1:3]),
+  "2457_IFN" = sd(norm.sums[16:18]),
+  "2457_4sU_30m" = sd(norm.sums[4:6]),
+  "2457_IFN_4sU_30m" = sd(norm.sums[19:21]),
+  "2457_4sU_60m" = sd(norm.sums[7:9]),
+  "2457_IFN_4sU_60m" = sd(norm.sums[22:24]),
+  "3006" = sd(norm.sums[31:33]),
+  "3006_IFN" = sd(norm.sums[46:48]),
+  "3006_4sU_30m" = sd(norm.sums[34:36]),
+  "3006_IFN_4sU_30m" = sd(norm.sums[49:51]),
+  "3006_4sU_60m" = sd(norm.sums[37:39]),
+  "3006_IFN_4sU_60m" = sd(norm.sums[52:54])
+)
+# put data in correct format for plot
+bar.data <- data.frame(
+  name = colnames(rep.mean),
+  counts = t(rep.mean),
+  sd = t(rep.sd),
+  variable = rep(c("noIFN", "IFN"), 9)
+)
+# set order as factor 
+bar.data$name <- factor(bar.data$name, levels = bar.data$name)
+
+# set comparisons to get pvalues for
+p.comps <- list(
+  c("DMSO", "DMSO_IFN"),
+  c("DMSO_4sU_30m", "DMSO_IFN_4sU_30m"),
+  c("DMSO_4sU_60m", "DMSO_IFN_4sU_60m"),
+  c("2457", "2457_IFN"),
+  c("2457_4sU_30m", "2457_IFN_4sU_30m"),
+  c("2457_4sU_60m", "2457_IFN_4sU_60m"),
+  c("3006", "3006_IFN"),
+  c("3006_4sU_30m", "3006_IFN_4sU_30m"),
+  c("3006_4sU_60m", "3006_IFN_4sU_60m")
+  )
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_4sUonly.pdf"))
+ggplot(bar.data, aes(name, counts, fill = variable, color = variable)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(x = name, ymin = counts-sd, ymax = counts+sd), width = 0.4, colour = "grey30", alpha = 0.9, size = 1.3) +
+  scale_fill_manual("Interferon", values = c("noIFN" = "coral3", "IFN" = "darkslategray4")) + 
+  scale_color_manual("Interferon", values = c("noIFN" = "coral3", "IFN" = "darkslategray4")) + 
+  labs(x = "", y = "normalised counts") +    # set multiple labels at once
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) #+
+#  stat_compare_means(comparisons = p.comps) + 
+#  stat_compare_means(label.y = 2750000)
+dev.off()
+
+# remake data format to use plot better for adding sig values
+bar.full <- data.frame(
+  "conditions" = c(rep("DMSO", 6), rep("DMSO_4sU_30m", 6), rep("DMSO_4sU_60m", 6), rep("2457", 6), rep("2457_4sU_30m", 6), rep("2457_4sU_60m", 6), rep("3006", 6), rep("3006_4sU_30m", 6), rep("3006_4sU_60m", 6)),
+  "counts" = norm.sums[c(61:63, 76:78, 64:66, 79:81, 67:69, 82:84, 1:3, 16:18, 4:6, 19:21, 7:9, 22:24, 31:33, 46:48, 34:36, 49:51, 37:39, 52:54)],
+  "Interferon" = rep(c(rep("noIFN", 3), rep("IFN", 3)), 9)
+)
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_4sU_early_sig.pdf"))
+ggbarplot(bar.full, x = "conditions", y = "counts", add = "mean_sd", color = "Interferon", position = position_dodge(0.8)) +
+#  geom_col(alpha = 0.7) +
+#  geom_errorbar(aes(x = name, ymin = counts-sd, ymax = counts+sd), width = 0.4, colour = "grey30", alpha = 0.9, size = 1.3) +
+  scale_fill_manual("Interferon", values = c("noIFN" = "coral3", "IFN" = "darkslategray4")) + 
+  scale_color_manual("Interferon", values = c("noIFN" = "coral3", "IFN" = "darkslategray4")) + 
+  labs(x = "", y = "normalised counts") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  stat_compare_means(aes(group = Interferon), label = "p.signif", method = "t.test")
+dev.off()
+```
+
+# make a correlation matrix of normalised counts across samples from heatmaps
+```{r}
+library(corrplot)
+# get rep means of norm counts of samples of interest
+# make normalised counts matrix
+all.norm <- counts.obs$Mm_TCcounts$counts %*% diag(counts.obs$Mm_TCcounts$samples$norm.factors)
+colnames(all.norm) <- snames
+# get mean across replicates
+rep.mean <- cbind(
+  "DMSO" = rowMeans(all.norm[, 61:63]),
+  "DMSO_IFN" = rowMeans(all.norm[, 76:78]),
+  "DMSO_4sU_30m" = rowMeans(all.norm[, 64:66]),
+  "DMSO_IFN_4sU_30m" = rowMeans(all.norm[, 79:81]),
+  "DMSO_4sU_60m" = rowMeans(all.norm[, 67:69]),
+  "DMSO_IFN_4sU_60m" = rowMeans(all.norm[, 82:84]),
+  "DMSO_4sU_6h" = rowMeans(all.norm[, 70:72]),
+  "DMSO_IFN_4sU_6h" = rowMeans(all.norm[, 85:87]),
+  "DMSO_4sU_U_6h" = rowMeans(all.norm[, 73:75]),
+  "DMSO_IFN_4sU_U_6h" = rowMeans(all.norm[, 88:90]),
+  "2457" = rowMeans(all.norm[, 1:3]),
+  "2457_IFN" = rowMeans(all.norm[, 16:18]),
+  "2457_4sU_30m" = rowMeans(all.norm[, 4:6]),
+  "2457_IFN_4sU_30m" = rowMeans(all.norm[, 19:21]),
+  "2457_4sU_60m" = rowMeans(all.norm[, 7:9]),
+  "2457_IFN_4sU_60m" = rowMeans(all.norm[, 22:24]),
+  "2457_4sU_6h" = rowMeans(all.norm[, 10:12]),
+  "2457_IFN_4sU_6h" = rowMeans(all.norm[, 25:27]),
+  "2457_4sU_U_6h" = rowMeans(all.norm[, 13:15]),
+  "2457_IFN_4sU_U_6h" = rowMeans(all.norm[, 28:30]),
+  "3006" = rowMeans(all.norm[, 31:33]),
+  "3006_IFN" = rowMeans(all.norm[, 46:48]),
+  "3006_4sU_30m" = rowMeans(all.norm[, 34:36]),
+  "3006_IFN_4sU_30m" = rowMeans(all.norm[, 49:51]),
+  "3006_4sU_60m" = rowMeans(all.norm[, 37:39]),
+  "3006_IFN_4sU_60m" = rowMeans(all.norm[, 52:54]),
+  "3006_4sU_6h" = rowMeans(all.norm[, 40:42]),
+  "3006_IFN_4sU_6h" = rowMeans(all.norm[, 55:57]),
+  "3006_4sU_U_6h" = rowMeans(all.norm[, 43:45]),
+  "3006_IFN_4sU_U_6h" = rowMeans(all.norm[, 58:60])
+  )
+# get correlation matrix
+rep.cor <- cor(rep.mean)
+iso.cor.dir <- file.path(iso.plots.dir, "corr_plots")
+
+# circle cor mat, ordered by AOE
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_circle.pdf"))
+corrplot(rep.cor, order = "AOE", tl.col = "black", tl.cex = 0.5)
+dev.off()
+# mixed cor mat, ordered by AOE
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_number_color.pdf"))
+corrplot.mixed(rep.cor, lower = "number", upper = "color", order = "AOE", tl.pos = "lt", tl.col = "black", tl.cex = 0.5, number.cex = 0.4)
+dev.off()
+# mixed cor plot color and square
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_square_ellipse.pdf"))
+corrplot.mixed(rep.cor, lower = "square", upper = "ellipse", order = "AOE", tl.pos = "lt", tl.col = "black", tl.cex = 0.5, number.cex = 0.4)
+dev.off()
+# half pie style
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_pie_half.pdf"))
+corrplot(rep.cor, order = "AOE", tl.col = "black", tl.cex = 0.5, method = "pie", type = "upper")
+dev.off()
+
+# subset to drug stabilised genes and makd cor plots
+rownames(rep.mean) <- gsub("_3utr", "", rownames(rep.mean))
+stab.rep.mean <- rep.mean[drug.stab$enst,]
+stab.rep.cor <- cor(stab.rep.mean)
+
+# circle cor mat, ordered by AOE
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_stab_circle.pdf"))
+corrplot(stab.rep.cor, order = "AOE", tl.col = "black", tl.cex = 0.5)
+dev.off()
+# mixed cor mat, ordered by AOE
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_stab_number_color.pdf"))
+corrplot.mixed(stab.rep.cor, lower = "number", upper = "color", order = "AOE", tl.pos = "lt", tl.col = "black", tl.cex = 0.5, number.cex = 0.4)
+dev.off()
+# mixed cor plot color and square
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_stab_square_ellipse.pdf"))
+corrplot.mixed(stab.rep.cor, lower = "square", upper = "ellipse", order = "AOE", tl.pos = "lt", tl.col = "black", tl.cex = 0.5, number.cex = 0.4)
+dev.off()
+# half pie style
+pdf(file.path(iso.cor.dir, "corrplot_TMM_TCcounts_stab_pie_half.pdf"))
+corrplot(stab.rep.cor, order = "AOE", tl.col = "black", tl.cex = 0.5, method = "pie", type = "upper")
+dev.off()
+```
+
+# make line plot for each drug stabilised transcript set change over time
+```{r}
+# use normalised counts as above and remove "_3utr" from counts to match properly
+rownames(all.norm) <- gsub("_3utr", "", rownames(all.norm))
+
+# get only transcripts diff stab for comp
+n2457.counts <- all.norm[noifn2457.stab$enst, c(10:15, 70:75)]
+
+# try with means rather than all values
+n2457.line.data <- data.frame(
+  "abundance" = colMeans(n2457.counts),
+  "treatment" = c(rep("2457", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_noIFN_stab.pdf"))
+ggline(n2457.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("2457vDMSO differentially stabilised n = ", nrow(n2457.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+# same for other comparisons
+n3006.counts <- all.norm[noifn3006.stab$enst, c(40:45, 70:75)]
+
+n3006.line.data <- data.frame(
+  "abundance" = colMeans(n3006.counts),
+  "treatment" = c(rep("3006", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_noIFN_stab.pdf"))
+ggline(n3006.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("3006vDMSO differentially stabilised n = ", nrow(n3006.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i2457.counts <- all.norm[ifn2457.stab$enst, c(25:30, 85:90)]
+i2457.line.data <- data.frame(
+  "abundance" = colMeans(i2457.counts),
+  "treatment" = c(rep("2457+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_IFN_stab.pdf"))
+ggline(i2457.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN+2457vIFN+DMSO differentially stabilised n = ", nrow(i2457.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i3006.counts <- all.norm[ifn3006.stab$enst, c(55:60, 85:90)]
+i3006.line.data <- data.frame(
+  "abundance" = colMeans(i3006.counts),
+  "treatment" = c(rep("3006+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_IFN_stab.pdf"))
+ggline(i3006.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN+3006vIFN+DMSO differentially stabilised n = ", nrow(i3006.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+# write out each "drug stabilised" gene list
+write.table(
+  noifn2457.stab,
+  file.path(iso.results.dir, "drug_stabilised/2457_noIFN_stabilised_transcripts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE, 
+  quote = FALSE
+)
+write.table(
+  noifn3006.stab,
+  file.path(iso.results.dir, "drug_stabilised/3006_noIFN_stabilised_transcripts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE, 
+  quote = FALSE
+)
+write.table(
+  ifn2457.stab,
+  file.path(iso.results.dir, "drug_stabilised/2457_IFN_stabilised_transcripts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE, 
+  quote = FALSE
+)
+write.table(
+  ifn3006.stab,
+  file.path(iso.results.dir, "drug_stabilised/3006_IFN_stabilised_transcripts.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE, 
+  quote = FALSE
+)
+```
+
+# make line plots as above, but for diff transcripts from direct endpoint comparisons
+```{r}
+# get each set of genes that are significantly up in drug/dmso 
+n2457.dmso <- ftest.list[["noIFN_4sU_U_6h_2457vDMSO"]]$table
+n2457.dmso <- n2457.dmso[which(n2457.dmso$PValue < 10e-6 & n2457.dmso$logFC > 0),]
+n3006.dmso <- ftest.list[["noIFN_4sU_U_6h_3006vDMSO"]]$table
+n3006.dmso <- n3006.dmso[which(n3006.dmso$PValue < 10e-6 & n3006.dmso$logFC > 0),]
+i2457.dmso <- ftest.list[["IFN_4sU_U_6h_2457vDMSO"]]$table
+i2457.dmso <- i2457.dmso[which(i2457.dmso$PValue < 10e-6 & i2457.dmso$logFC > 0),]
+i3006.dmso <- ftest.list[["IFN_4sU_U_6h_3006vDMSO"]]$table
+i3006.dmso <- i3006.dmso[which(i3006.dmso$PValue < 10e-6 & i3006.dmso$logFC > 0),]
+
+# get only transcripts diff stab for comp
+n2457d.counts <- all.norm[n2457.dmso$enst, c(10:15, 70:75)]
+
+# try with means rather than all values
+n2457d.line.data <- data.frame(
+  "abundance" = colMeans(n2457d.counts),
+  "treatment" = c(rep("2457", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_noIFN_endpoint.pdf"))
+ggline(n2457d.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("4sU_U 2457vDMSO n = ", nrow(n2457d.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+# same for other comparisons
+n3006d.counts <- all.norm[n3006.dmso$enst, c(40:45, 70:75)]
+n3006d.line.data <- data.frame(
+  "abundance" = colMeans(n3006d.counts),
+  "treatment" = c(rep("3006", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_noIFN_endpoint.pdf"))
+ggline(n3006d.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("4sU_U 3006vDMSO n = ", nrow(n3006d.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i2457d.counts <- all.norm[i2457.dmso$enst, c(25:30, 85:90)]
+i2457d.line.data <- data.frame(
+  "abundance" = colMeans(i2457d.counts),
+  "treatment" = c(rep("2457+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_IFN_endpoint.pdf"))
+ggline(i2457d.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN 4sU_U 2457vDMSO n = ", nrow(i2457d.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i3006d.counts <- all.norm[i3006.dmso$enst, c(55:60, 85:90)]
+i3006d.line.data <- data.frame(
+  "abundance" = colMeans(i3006d.counts),
+  "treatment" = c(rep("3006+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_IFN_endpoint.pdf"))
+ggline(i3006d.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN 4sU_U 3006vDMSO n = ", nrow(i3006d.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+```
+
+# endpoint line plots demonstrate too much difference in expression at 6h timepoint to compare only endpoints, better to use "drug stabilised"
+# make boxplots for drug stabilised groups
+```{r}
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_TMMnorm_TCcounts_2457_noIFN_stab.pdf"))
+ggboxplot(n2457.line.data, x = "timepoint", y = "abundance", color = "treatment", palette = "jco") +
+  labs(x = paste0("2457vDMSO differentially stabilised n = ", nrow(n2457.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_TMMnorm_TCcounts_3006_noIFN_stab.pdf"))
+ggboxplot(n3006.line.data, x = "timepoint", y = "abundance", color = "treatment", palette = "jco") +
+  labs(x = paste0("3006vDMSO differentially stabilised n = ", nrow(n3006.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_TMMnorm_TCcounts_2457_IFN_stab.pdf"))
+ggboxplot(i2457.line.data, x = "timepoint", y = "abundance", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN+2457vIFN+DMSO differentially stabilised n = ", nrow(i2457.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_TMMnorm_TCcounts_3006_IFN_stab.pdf"))
+ggboxplot(i3006.line.data, x = "timepoint", y = "abundance", color = "treatment", palette = "jco") +
+  labs(x = paste0("IFN+3006vIFN+DMSO differentially stabilised n = ", nrow(i3006.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+```
+
+# boxplots by FC at each condition
+```{r}
+n2457.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n2457.counts[, 1:3])/rowMeans(n2457.counts[, 7:9])), log2(rowMeans(n2457.counts[, 4:6])/rowMeans(n2457.counts[, 10:12]))),
+  "conditions" = c(rep("4sU", nrow(n2457.counts)), rep("4sU_U", nrow(n2457.counts)))
+)
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_2457_noIFN_stab.pdf"))
+ggboxplot(n2457.box.data, x = "conditions", y = "LFC", color = "conditions", palette = "jco") +
+  labs(x = paste0("2457vDMSO differentially stabilised n = ", nrow(n2457.counts)), y = "log2 fold change 2457/DMSO") + 
+  stat_compare_means()
+dev.off()
+
+n3006.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n3006.counts[, 1:3])/rowMeans(n3006.counts[, 7:9])), log2(rowMeans(n3006.counts[, 4:6])/rowMeans(n3006.counts[, 10:12]))),
+  "conditions" = c(rep("4sU", nrow(n3006.counts)), rep("4sU_U", nrow(n3006.counts)))
+)
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_3006_noIFN_stab.pdf"))
+ggboxplot(n3006.box.data, x = "conditions", y = "LFC", color = "conditions", palette = "jco") +
+  labs(x = paste0("3006vDMSO differentially stabilised n = ", nrow(n3006.counts)), y = "log2 fold change 3006/DMSO") + 
+  stat_compare_means()
+dev.off()
+
+i2457.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i2457.counts[, 1:3])/rowMeans(i2457.counts[, 7:9])), log2(rowMeans(i2457.counts[, 4:6])/rowMeans(i2457.counts[, 10:12]))),
+  "conditions" = c(rep("4sU", nrow(i2457.counts)), rep("4sU_U", nrow(i2457.counts)))
+)
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_2457_IFN_stab.pdf"))
+ggboxplot(i2457.box.data, x = "conditions", y = "LFC", color = "conditions", palette = "jco") +
+  labs(x = paste0("IFN+2457vIFN+DMSO differentially stabilised n = ", nrow(i2457.counts)), y = "log2 fold change 2457/DMSO") + 
+  stat_compare_means()
+dev.off()
+
+i3006.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i3006.counts[, 1:3])/rowMeans(i3006.counts[, 7:9])), log2(rowMeans(i3006.counts[, 4:6])/rowMeans(i3006.counts[, 10:12]))),
+  "conditions" = c(rep("4sU", nrow(i3006.counts)), rep("4sU_U", nrow(i3006.counts)))
+)
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_3006_IFN_stab.pdf"))
+ggboxplot(i3006.box.data, x = "conditions", y = "LFC", color = "conditions", palette = "jco") +
+  labs(x = paste0("IFN+3006vIFN+DMSO differentially stabilised n = ", nrow(i3006.counts)), y = "log2 fold change 3006/DMSO") + 
+  stat_compare_means()
+dev.off()
+
+# make single plot with all FC groups
+all.box.data <- rbind(n2457.box.data, n3006.box.data, i2457.box.data, i3006.box.data)
+all.box.data$treatment <- c(rep("2457", nrow(n2457.box.data)), rep("3006", nrow(n3006.box.data)), rep("2457+IFN", nrow(i2457.box.data)), rep("3006+IFN", nrow(i3006.box.data)))
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_ALL_stab.pdf"))
+ggboxplot(all.box.data, x = "treatment", y = "LFC", color = "conditions", palette = "jco") +
+  labs(x = "drug stabilised transcripts", y = "log2 fold change drug/DMSO") + 
+  stat_compare_means(aes(group = conditions), label = "p.signif")
+dev.off()
+
+# have a look at this as violin
+pdf(file = file.path(iso.plots.dir, "violinplot_LFC_TCcounts_ALL_stab.pdf"))
+ggplot(all.box.data, aes(x = treatment, y = LFC, fill = conditions, palette = "jco")) +
+  geom_violin() + 
+  stat_compare_means(aes(group = conditions), label = "p.signif")
+dev.off()
+```
+
+# used DESeq2 set up diff analysis for 2 variables as log likelihood of difference between full model and reduced model
+```{r}
+library(DESeq2)
+
+# get reduced counts matrix with 6h samples only
+TCcountData <- counts.obs$Mm_TCcounts$counts
+TCData.6h <- TCcountData[, grepl("6hr", colnames(TCcountData))]
+
+# remove drosophila
+dros <- which(substr(rownames(TCData.6h), 1, 4) == "FBgn")
+TCData.6h <- TCData.6h[-dros, ]
+rownames(TCData.6h) <- gsub("_3utr", "", rownames(TCData.6h))
+
+# set up samples ann for this analysis
+sample.6h <- sample.info[grepl("6hr", sample.info$samples), -1]
+rownames(sample.6h) <- sample.6h$samples
+# test to ensure identical
+all(rownames(sample.6h) == colnames(TCData.6h))
+
+# add IFN to treatment
+sample.6h$treatment <- ifelse(sample.6h$interferon, paste0("IFN_", sample.6h$treatment), sample.6h$treatment)
+
+# first for 2457vDMSO
+# set full model with treatment:condition variable
+n2.dds <- DESeqDataSetFromMatrix(countData = TCData.6h[, c(1:6, 25:30)], colData = sample.6h[c(1:6, 25:30), ], design = ~ conditions + treatment + conditions:treatment)
+# now run LRT on reduced model
+n2.dds.lrt <- DESeq(n2.dds, test = "LRT", reduced = ~ conditions + treatment)
+
+n2.res <- results(n2.dds.lrt)
+
+# run LRT modeling in same fashion for each additional comparison
+n3.dds <- DESeqDataSetFromMatrix(countData = TCData.6h[, c(13:18, 25:30)], colData = sample.6h[c(13:18, 25:30), ], design = ~ conditions + treatment + conditions:treatment)
+n3.dds.lrt <- DESeq(n3.dds, test = "LRT", reduced = ~ conditions + treatment)
+n3.res <- results(n3.dds.lrt)
+
+i2.dds <- DESeqDataSetFromMatrix(countData = TCData.6h[, c(7:12, 31:36)], colData = sample.6h[c(7:12, 31:36), ], design = ~ conditions + treatment + conditions:treatment)
+i2.dds.lrt <- DESeq(i2.dds, test = "LRT", reduced = ~ conditions + treatment)
+i2.res <- results(i2.dds.lrt)
+
+i3.dds <- DESeqDataSetFromMatrix(countData = TCData.6h[, c(19:24, 31:36)], colData = sample.6h[c(19:24, 31:36), ], design = ~ conditions + treatment + conditions:treatment)
+i3.dds.lrt <- DESeq(i3.dds, test = "LRT", reduced = ~ conditions + treatment)
+i3.res <- results(i3.dds.lrt)
+```
+
+# make line plots for log likelihood res
+```{r}
+# get only transcripts diff stab for comp
+n2.counts <- all.norm[rownames(n2.res)[which(n2.res$padj < 0.05)], c(10:15, 70:75)]
+
+# try with means rather than all values
+n2.line.data <- data.frame(
+  "abundance" = colMeans(n2.counts),
+  "treatment" = c(rep("2457", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_noIFN_LRTest.pdf"))
+ggline(n2.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("LRT differentially stabilised n = ", nrow(n2.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+# same for other comparisons
+n3.counts <- all.norm[rownames(n3.res)[which(n3.res$padj < 0.05)], c(40:45, 70:75)]
+n3.line.data <- data.frame(
+  "abundance" = colMeans(n3.counts),
+  "treatment" = c(rep("3006", 6), rep("DMSO", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_noIFN_LRTest.pdf"))
+ggline(n3.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("LRT differentially stabilised n = ", nrow(n3.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i2.counts <- all.norm[rownames(i2.res)[which(i2.res$padj < 0.05)], c(25:30, 85:90)]
+i2.line.data <- data.frame(
+  "abundance" = colMeans(i2.counts),
+  "treatment" = c(rep("2457+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_2457_IFN_LRTest.pdf"))
+ggline(i2.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("LRT differentially stabilised n = ", nrow(i2.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+
+i3.counts <- all.norm[rownames(i3.res)[which(i3.res$padj < 0.05)], c(55:60, 85:90)]
+i3.line.data <- data.frame(
+  "abundance" = colMeans(i3.counts),
+  "treatment" = c(rep("3006+IFN", 6), rep("DMSO+IFN", 6)),
+  "timepoint" = c(rep(c(rep("4sU", 3), rep("4sU_U", 3)), 2))
+)
+
+pdf(file = file.path(iso.plots.dir, "line_plots/lineplot_TMMnorm_TCcounts_3006_IFN_LRTest.pdf"))
+ggline(i3.line.data, x = "timepoint", y = "abundance", add = "mean_se", color = "treatment", palette = "jco") +
+  labs(x = paste0("LRT differentially stabilised n = ", nrow(i3.counts)), y = "mean transcript abundance") + 
+  stat_compare_means(aes(group = treatment), method = "t.test")
+dev.off()
+```
+
+# make boxplot of these to compare LFC in each treatment over condition
+```{r}
+n2.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n2.counts[, 10:12])/rowMeans(n2.counts[, 7:9])), log2(rowMeans(n2.counts[, 4:6])/rowMeans(n2.counts[, 1:3]))),
+  "treatment" = c(rep("DMSO", nrow(n2.counts)), rep("2457", nrow(n2.counts)))
+)
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_2457_noIFN_LRTest.pdf"))
+ggboxplot(n2.box.data, x = "treatment", y = "LFC", color = "treatment", palette = "jco") +
+  labs(x = paste0("LRT differentially stabilised n = ", nrow(n2.counts)), y = "log2 fold change 4sU_U/4sU") + 
+  stat_compare_means()
+dev.off()
+
+n3.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n3.counts[, 10:12])/rowMeans(n3.counts[, 7:9])), log2(rowMeans(n3.counts[, 4:6])/rowMeans(n3.counts[, 1:3]))),
+  "treatment" = c(rep("DMSO", nrow(n3.counts)), rep("2457", nrow(n3.counts)))
+)
+
+i2.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i2.counts[, 10:12])/rowMeans(i2.counts[, 7:9])), log2(rowMeans(i2.counts[, 4:6])/rowMeans(i2.counts[, 1:3]))),
+  "treatment" = c(rep("DMSO", nrow(i2.counts)), rep("2457", nrow(i2.counts)))
+)
+
+i3.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i3.counts[, 10:12])/rowMeans(i3.counts[, 7:9])), log2(rowMeans(i3.counts[, 4:6])/rowMeans(i3.counts[, 1:3]))),
+  "treatment" = c(rep("DMSO", nrow(i3.counts)), rep("2457", nrow(i3.counts)))
+)
+
+all.box.lrt <- rbind(n2.box.data, n3.box.data, i2.box.data, i3.box.data)
+all.box.lrt$tx <- c(rep("2457", nrow(n2.box.data)), rep("3006", nrow(n3.box.data)), rep("2457+IFN", nrow(i2.box.data)), rep("3006+IFN", nrow(i3.box.data)))
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_TCcounts_ALL_LRTest.pdf"))
+ggboxplot(all.box.lrt, x = "tx", y = "LFC", color = "treatment", palette = "jco") +
+  labs(x = "LRT differentially stabilised transcripts", y = "log2 fold change 4sU_U/4sU") + 
+  stat_compare_means(aes(group = treatment), label = "p.signif")
+dev.off()
+```
+
+# drug stabilised from heatmap etc seems to best capture the message, so work with these for further analysis
+```{r}
+n2d.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n2457.counts[, 10:12])/rowMeans(n2457.counts[, 7:9])), log2(rowMeans(n2457.counts[, 4:6])/rowMeans(n2457.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n2457.counts)), rep("drug", nrow(n2457.counts)))
+)
+
+n3d.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(n3006.counts[, 10:12])/rowMeans(n3006.counts[, 7:9])), log2(rowMeans(n3006.counts[, 4:6])/rowMeans(n3006.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n3006.counts)), rep("drug", nrow(n3006.counts)))
+)
+
+i2d.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i2457.counts[, 10:12])/rowMeans(i2457.counts[, 7:9])), log2(rowMeans(i2457.counts[, 4:6])/rowMeans(i2457.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i2457.counts)), rep("drug", nrow(i2457.counts)))
+)
+
+i3d.box.data <- data.frame(
+  "LFC" = c(log2(rowMeans(i3006.counts[, 10:12])/rowMeans(i3006.counts[, 7:9])), log2(rowMeans(i3006.counts[, 4:6])/rowMeans(i3006.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i3006.counts)), rep("drug", nrow(i3006.counts)))
+)
+
+all.box.data <- rbind(n2d.box.data, n3d.box.data, i2d.box.data, i3d.box.data)
+all.box.data$tx <- c(rep("2457", nrow(n2d.box.data)), rep("3006", nrow(n3d.box.data)), rep("2457+IFN", nrow(i2d.box.data)), rep("3006+IFN", nrow(i3d.box.data)))
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_4sU_Uv4sU_TCcounts_ALL_stab.pdf"))
+ggboxplot(all.box.data, x = "tx", y = "LFC", color = "treatment", palette = "jco") +
+  labs(x = "drug stabilised transcripts", y = "log2 fold change 4sU_U/4sU") + 
+  stat_compare_means(aes(group = treatment), label = "p.signif")
+dev.off()
+
+# make same boxplot for all transcripts
+all.6h.counts <- all.norm[, grepl("6h", colnames(all.norm))]
+
+all.tx.box <- data.frame(
+  "LFC" = c(
+    log2(rowMeans(all.6h.counts[, 28:30])/rowMeans(all.6h.counts[, 25:27])),
+    log2(rowMeans(all.6h.counts[, 4:6])/rowMeans(all.6h.counts[, 1:3])),
+    log2(rowMeans(all.6h.counts[, 16:18])/rowMeans(all.6h.counts[, 13:15])),
+    log2(rowMeans(all.6h.counts[, 33:36])/rowMeans(all.6h.counts[, 31:33])),
+    log2(rowMeans(all.6h.counts[, 10:12])/rowMeans(all.6h.counts[, 7:9])),
+    log2(rowMeans(all.6h.counts[, 22:24])/rowMeans(all.6h.counts[, 19:21]))
+  ),
+  "treatment" = c(rep(c(rep("DMSO", nrow(all.6h.counts)), rep("2457", nrow(all.6h.counts)), rep("3006", nrow(all.6h.counts))), 2)),
+  "condition" = c(rep("no interferon", nrow(all.6h.counts) * 3), rep("interferon", nrow(all.6h.counts) * 3))
+)
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_4sU_Uv4sU_TCcounts_ALL.pdf"))
+ggboxplot(all.tx.box, x = "treatment", y = "LFC", color = "treatment", facet.by = "condition", palette = "jco") +
+  labs(x = paste0("all non-zero transcripts n = ", nrow(all.6h.counts)), y = "log2 fold change 4sU_U/4sU")
+dev.off()
+```
+
+# make lists of drug stabilised genes with diff LFC
+```{r}
+# get DE table
+noifn2457 <- ftest.list[["noIFN_2457_4sU_U_6hv4sU_6h"]]$table
+noifn3006 <- ftest.list[["noIFN_3006_4sU_U_6hv4sU_6h"]]$table
+noifnDMSO <- ftest.list[["noIFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+ifn2457 <- ftest.list[["IFN_2457_4sU_U_6hv4sU_6h"]]$table
+ifn3006 <- ftest.list[["IFN_3006_4sU_U_6hv4sU_6h"]]$table
+ifnDMSO <- ftest.list[["IFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+
+
+n2.stab <- noifn2457[which(noifn2457$enst %in% noifn2457.stab$enst), c("enst", "symbol", "logFC")]
+n2d.stab <- noifnDMSO[which(noifnDMSO$enst %in% noifn2457.stab$enst), c("enst", "symbol", "logFC")]
+n3.stab <- noifn3006[which(noifn3006$enst %in% noifn3006.stab$enst), c("enst", "symbol", "logFC")]
+n3d.stab <- noifnDMSO[which(noifnDMSO$enst %in% noifn3006.stab$enst), c("enst", "symbol", "logFC")]
+i2.stab <- ifn2457[which(ifn2457$enst %in% ifn2457.stab$enst), c("enst", "symbol", "logFC")]
+i2d.stab <- ifnDMSO[which(ifnDMSO$enst %in% ifn2457.stab$enst), c("enst", "symbol", "logFC")]
+i3.stab <- ifn3006[which(ifn3006$enst %in% ifn3006.stab$enst), c("enst", "symbol", "logFC")]
+i3d.stab <- ifnDMSO[which(ifnDMSO$enst %in% ifn3006.stab$enst), c("enst", "symbol", "logFC")]
+
+# make table with each drug and dmso comb LFC values and diff between them, then write out
+n2d.lfc.table <- merge(n2.stab, n2d.stab, by = c("enst", "symbol"))
+colnames(n2d.lfc.table)[3:4] <- c("logFC_2457", "logFC_DMSO")
+n2d.lfc.table$diff_logFC <- n2d.lfc.table$logFC_2457 - n2d.lfc.table$logFC_DMSO
+n2d.lfc.table <- n2d.lfc.table[-which(is.na(n2d.lfc.table$symbol)), ]
+n2d.lfc.table <- n2d.lfc.table[order(n2d.lfc.table$diff_logFC, decreasing = TRUE), ]
+write.table(
+  n2d.lfc.table,
+  file.path(iso.results.dir, "drug_stabilised/2457_noIFN_stabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+n3d.lfc.table <- merge(n3.stab, n3d.stab, by = c("enst", "symbol"))
+colnames(n3d.lfc.table)[3:4] <- c("logFC_3006", "logFC_DMSO")
+n3d.lfc.table$diff_logFC <- n3d.lfc.table$logFC_3006 - n3d.lfc.table$logFC_DMSO
+n3d.lfc.table <- n3d.lfc.table[-which(is.na(n3d.lfc.table$symbol)), ]
+n3d.lfc.table <- n3d.lfc.table[order(n3d.lfc.table$diff_logFC, decreasing = TRUE), ]
+write.table(
+  n3d.lfc.table,
+  file.path(iso.results.dir, "drug_stabilised/3006_noIFN_stabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i2d.lfc.table <- merge(i2.stab, i2d.stab, by = c("enst", "symbol"))
+colnames(i2d.lfc.table)[3:4] <- c("logFC_2457_IFN", "logFC_DMSO_IFN")
+i2d.lfc.table$diff_logFC <- i2d.lfc.table$logFC_2457_IFN - i2d.lfc.table$logFC_DMSO_IFN
+i2d.lfc.table <- i2d.lfc.table[-which(is.na(i2d.lfc.table$symbol)), ]
+i2d.lfc.table <- i2d.lfc.table[order(i2d.lfc.table$diff_logFC, decreasing = TRUE), ]
+write.table(
+  i2d.lfc.table,
+  file.path(iso.results.dir, "drug_stabilised/2457_IFN_stabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i3d.lfc.table <- merge(i3.stab, i3d.stab, by = c("enst", "symbol"))
+colnames(i3d.lfc.table)[3:4] <- c("logFC_3006_IFN", "logFC_DMSO_IFN")
+i3d.lfc.table$diff_logFC <- i3d.lfc.table$logFC_3006_IFN - i3d.lfc.table$logFC_DMSO_IFN
+i3d.lfc.table <- i3d.lfc.table[-which(is.na(i3d.lfc.table$symbol)), ]
+i3d.lfc.table <- i3d.lfc.table[order(i3d.lfc.table$diff_logFC, decreasing = TRUE), ]
+write.table(
+  i3d.lfc.table,
+  file.path(iso.results.dir, "drug_stabilised/3006_IFN_stabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# do GSEA on drug stabilised sets, starting with LFC diff >1
+```{r}
+library(enrichR)
+
+dbs <- c("RNAseq_Automatic_GEO_Signatures_Mouse_Up", "RNAseq_Automatic_GEO_Signatures_Mouse_Down", "Mouse_Gene_Atlas", "KEGG_2019_Mouse", "WikiPathways_2019_Mouse", "MGI_Mammalian_Phenotype_Level_4_2021", "MGI_Mammalian_Phenotype_2017", "MGI_Mammalian_Phenotype_Level_3")
+
+n2d.gsea <- n2d.lfc.table[which(n2d.lfc.table$diff_logFC >1), ]
+n2.enrich <- enrichr(unique(n2d.gsea$symbol), dbs)
+pdf(file.path(iso.plots.dir, "enrichR/enrichR_2457_noIFN_LFCdiff1.pdf"), height = 8, width = 10)
+plotEnrich(n2.enrich[[1]], numChar = 65, title = names(n2.enrich)[[1]])
+plotEnrich(n2.enrich[[2]], numChar = 65, title = names(n2.enrich)[[2]])
+plotEnrich(n2.enrich[[3]], numChar = 65, title = names(n2.enrich)[[3]])
+plotEnrich(n2.enrich[[4]], numChar = 65, title = names(n2.enrich)[[4]])
+plotEnrich(n2.enrich[[5]], numChar = 65, title = names(n2.enrich)[[5]])
+plotEnrich(n2.enrich[[6]], numChar = 65, title = names(n2.enrich)[[6]])
+plotEnrich(n2.enrich[[7]], numChar = 65, title = names(n2.enrich)[[7]])
+plotEnrich(n2.enrich[[8]], numChar = 65, title = names(n2.enrich)[[8]])
+dev.off()
+
+n3d.gsea <- n3d.lfc.table[which(n3d.lfc.table$diff_logFC >1), ]
+n3.enrich <- enrichr(unique(n3d.gsea$symbol), dbs)
+pdf(file.path(iso.plots.dir, "enrichR/enrichR_3006_noIFN_LFCdiff1.pdf"), height = 8, width = 10)
+plotEnrich(n3.enrich[[1]], numChar = 65, title = names(n3.enrich)[[1]])
+plotEnrich(n3.enrich[[2]], numChar = 65, title = names(n3.enrich)[[2]])
+plotEnrich(n3.enrich[[3]], numChar = 65, title = names(n3.enrich)[[3]])
+plotEnrich(n3.enrich[[4]], numChar = 65, title = names(n3.enrich)[[4]])
+plotEnrich(n3.enrich[[5]], numChar = 65, title = names(n3.enrich)[[5]])
+plotEnrich(n3.enrich[[6]], numChar = 65, title = names(n3.enrich)[[6]])
+plotEnrich(n3.enrich[[7]], numChar = 65, title = names(n3.enrich)[[7]])
+plotEnrich(n3.enrich[[8]], numChar = 65, title = names(n3.enrich)[[8]])
+dev.off()
+
+i2d.gsea <- i2d.lfc.table[which(i2d.lfc.table$diff_logFC >1), ]
+i2.enrich <- enrichr(unique(i2d.gsea$symbol), dbs)
+pdf(file.path(iso.plots.dir, "enrichR/enrichR_2457_IFN_LFCdiff1.pdf"), height = 8, width = 10)
+plotEnrich(i2.enrich[[1]], numChar = 65, title = names(i2.enrich)[[1]])
+plotEnrich(i2.enrich[[2]], numChar = 65, title = names(i2.enrich)[[2]])
+plotEnrich(i2.enrich[[3]], numChar = 65, title = names(i2.enrich)[[3]])
+plotEnrich(i2.enrich[[4]], numChar = 65, title = names(i2.enrich)[[4]])
+plotEnrich(i2.enrich[[5]], numChar = 65, title = names(i2.enrich)[[5]])
+plotEnrich(i2.enrich[[6]], numChar = 65, title = names(i2.enrich)[[6]])
+plotEnrich(i2.enrich[[7]], numChar = 65, title = names(i2.enrich)[[7]])
+plotEnrich(i2.enrich[[8]], numChar = 65, title = names(i2.enrich)[[8]])
+dev.off()
+
+i3d.gsea <- i3d.lfc.table[which(i3d.lfc.table$diff_logFC >1), ]
+i3.enrich <- enrichr(unique(i3d.gsea$symbol), dbs)
+pdf(file.path(iso.plots.dir, "enrichR/enrichR_3006_IFN_LFCdiff1.pdf"), height = 8, width = 10)
+plotEnrich(i3.enrich[[1]], numChar = 65, title = names(i3.enrich)[[1]])
+plotEnrich(i3.enrich[[2]], numChar = 65, title = names(i3.enrich)[[2]])
+plotEnrich(i3.enrich[[3]], numChar = 65, title = names(i3.enrich)[[3]])
+plotEnrich(i3.enrich[[4]], numChar = 65, title = names(i3.enrich)[[4]])
+plotEnrich(i3.enrich[[5]], numChar = 65, title = names(i3.enrich)[[5]])
+plotEnrich(i3.enrich[[6]], numChar = 65, title = names(i3.enrich)[[6]])
+plotEnrich(i3.enrich[[7]], numChar = 65, title = names(i3.enrich)[[7]])
+plotEnrich(i3.enrich[[8]], numChar = 65, title = names(i3.enrich)[[8]])
+dev.off()
+```
+
+# make cumulative distibution plot for each comparison by dif LFC
+```{r}
+cdf.df <- data.frame(
+  diff_LFC = c(n2d.lfc.table$diff_logFC, n3d.lfc.table$diff_logFC, i2d.lfc.table$diff_logFC, i3d.lfc.table$diff_logFC),
+  treatment = c(rep("2457 noIFN", nrow(n2d.lfc.table)), rep("3006 noIFN", nrow(n3d.lfc.table)), rep("2457 IFN", nrow(i2d.lfc.table)), rep("3006 IFN", nrow(i3d.lfc.table)))
+)
+
+pdf(file.path(iso.plots.dir, "cumulativeDist_diffLFC_all.pdf"))
+ggplot(cdf.df, aes(diff_LFC, colour = treatment)) + stat_ecdf(geom = "step") + theme_bw() 
+dev.off()
+```
+
+# get human orthologs of mouse genes and format for GSEA
+```{r}
+mouse_human_genes = read.csv("http://www.informatics.jax.org/downloads/reports/HOM_MouseHumanSequence.rpt", sep = "\t")
+
+convert_mouse_to_human <- function(gene_list){
+
+  output = NULL
+
+  for(gene in gene_list){
+    class_key = (mouse_human_genes %>% filter(Symbol == gene & Common.Organism.Name=="mouse, laboratory"))[['DB.Class.Key']]
+    if(!identical(class_key, integer(0)) ){
+      human_genes = (mouse_human_genes %>% filter(DB.Class.Key == class_key & Common.Organism.Name=="human"))[,"Symbol"]
+      for(human_gene in human_genes){
+        output = rbind(output, c(human_gene, gene))
+      }
+    }
+  }
+  
+  colnames(output) <- c("Hg_symbol", "Mm_symbol")
+  output <- as.data.frame(output)
+  return (output)
+}
+
+n2.diff <- fread(file.path(iso.results.dir, "drug_stabilised/2457_noIFN_stabilised_transcripts_diff_LFC.txt"))
+# remove duplicates (keeps highest ranked), and only get symbol and rank columns
+n2.diff <- n2.diff[!duplicated(n2.diff$symbol), c("symbol", "diff_logFC")]
+hg.genes <- convert_mouse_to_human(n2.diff$symbol)
+# remove dups keep first
+hg.genes <- hg.genes[!duplicated(hg.genes$Mm_symbol),]
+# merge ranked list with hg genes and only keep those with human orthologs
+n2.hg <- merge(n2.diff, hg.genes, by.x = "symbol", by.y = "Mm_symbol")
+n2.hg <- n2.hg[order(n2.hg$diff_logFC, decreasing = TRUE), c("Hg_symbol", "diff_logFC")]
+# write out for GSEA
+write.table(
+  n2.hg,
+  file.path(iso.results.dir, "drug_stabilised/Hg_2457_noIFN_stab_diffLFC_ranked.rnk"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+n3.diff <- fread(file.path(iso.results.dir, "durg_stabilised/3006_noIFN_stabilised_transcripts_diff_LFC.txt"))
+# remove duplicates (keeps highest ranked), and only get symbol and rank columns
+n3.diff <- n3.diff[!duplicated(n3.diff$symbol), c("symbol", "diff_logFC")]
+hg.genes <- convert_mouse_to_human(n3.diff$symbol)
+# remove dups keep first instance
+hg.genes <- hg.genes[!duplicated(hg.genes$Mm_symbol),]
+# merge ranked list with hg genes and only keep those with human orthologs
+n3.hg <- merge(n3.diff, hg.genes, by.x = "symbol", by.y = "Mm_symbol")
+n3.hg <- n3.hg[order(n3.hg$diff_logFC, decreasing = TRUE), c("Hg_symbol", "diff_logFC")]
+# write out for GSEA
+write.table(
+  n3.hg,
+  file.path(iso.results.dir, "drug_stabilised/Hg_3006_noIFN_stab_diffLFC_ranked.rnk"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i2.diff <- fread(file.path(iso.results.dir, "drug_stabilised/2457_IFN_stabilised_transcripts_diff_LFC.txt"))
+# remove duplicates (keeps highest ranked), and only get symbol and rank columns
+i2.diff <- i2.diff[!duplicated(i2.diff$symbol), c("symbol", "diff_logFC")]
+hg.genes <- convert_mouse_to_human(i2.diff$symbol)
+# remove dups keep first
+hg.genes <- hg.genes[!duplicated(hg.genes$Mm_symbol),]
+# merge ranked list with hg genes and only keep those with human orthologs
+i2.hg <- merge(i2.diff, hg.genes, by.x = "symbol", by.y = "Mm_symbol")
+i2.hg <- i2.hg[order(i2.hg$diff_logFC, decreasing = TRUE), c("Hg_symbol", "diff_logFC")]
+# write out for GSEA
+write.table(
+  i2.hg,
+  file.path(iso.results.dir, "drug_stabilised/Hg_2457_IFN_stab_diffLFC_ranked.rnk"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i3.diff <- fread(file.path(iso.results.dir, "drug_stabilised/3006_IFN_stabilised_transcripts_diff_LFC.txt"))
+# remove duplicates (keeps highest ranked), and only get symbol and rank columns
+i3.diff <- i3.diff[!duplicated(i3.diff$symbol), c("symbol", "diff_logFC")]
+hg.genes <- convert_mouse_to_human(i3.diff$symbol)
+# remove dups keep first instance
+hg.genes <- hg.genes[!duplicated(hg.genes$Mm_symbol),]
+# merge ranked list with hg genes and only keep those with human orthologs
+i3.hg <- merge(i3.diff, hg.genes, by.x = "symbol", by.y = "Mm_symbol")
+i3.hg <- i3.hg[order(i3.hg$diff_logFC, decreasing = TRUE), c("Hg_symbol", "diff_logFC")]
+# write out for GSEA
+write.table(
+  i3.hg,
+  file.path(iso.results.dir, "drug_stabilised/Hg_3006_IFN_stab_diffLFC_ranked.rnk"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# GSEA run on local desktop app for h.all, c2.all, c5.all, c6, c8.all
+
+# examine 60m samples noIFNvIFN
+```{r}
+# make IFN contrasts
+ifn.con.mat <- makeContrasts(
+  x2457_4sU_60m_IFNvnoIFN = IFN_2457_4sU_60m - noIFN_2457_4sU_60m,  
+  x3006_4sU_60m_IFNvnoIFN = IFN_3006_4sU_60m - noIFN_3006_4sU_60m,
+  DMSO_4sU_60m_IFNvnoIFN = IFN_DMSO_4sU_60m - noIFN_DMSO_4sU_60m,  
+  levels = design
+  )
+ifn.con.mat
+
+ifn.disp <- estimateDisp(TCcounts.norm, design)
+# get glm fit
+ifn.gfit <- glmQLFit(ifn.disp, design)
+# make empty list for ftest results
+ifn.ftest <- list()
+# loop through each contrast run ftest and write out results
+for(contrast.i in 1:length(colnames(ifn.con.mat))){
+  # get ftest results and save to list named for contrast
+  ifn.ftest[[contrast.i]] <- glmQLFTest(ifn.gfit, contrast = ifn.con.mat[ , contrast.i])
+  # remove 3utr from ensembl gene IDs
+  rownames(ifn.ftest[[contrast.i]]$table) <- gsub("_3utr", "", rownames(ifn.ftest[[contrast.i]]$table))
+  # add column for ens id
+  ifn.ftest[[contrast.i]]$table$enst <- rownames(ifn.ftest[[contrast.i]]$table)
+  # merge with ann file on ens id
+  ifn.ftest[[contrast.i]]$table <- merge(ifn.ftest[[contrast.i]]$table, enst.sym, by.x = "enst", by.y = "enst", all.x = TRUE)
+  # sort by pval
+  ifn.ftest[[contrast.i]]$table <- ifn.ftest[[contrast.i]]$table[order(ifn.ftest[[contrast.i]]$table$PValue), ]
+  # write ftest table
+  write.table(
+    ifn.ftest[[contrast.i]]$table,
+    file.path(iso.results.dir, "edger", paste0(colnames(ifn.con.mat)[contrast.i], "_TCcounts_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+
+# add names for referencing
+names(ifn.ftest) <- colnames(ifn.con.mat)
+```
+
+# make euler of IFN diff for each treatment
+```{r}
+library(VennDiagram)
+library(eulerr)
+
+# get unique sig genes for each treatment, exclude NAs
+sig.2457 <- unique(ifn.ftest$x2457_4sU_60m_IFNvnoIFN$table[which(ifn.ftest$x2457_4sU_60m_IFNvnoIFN$table$PValue < 10e-6), "symbol"])
+sig.2457 <- sig.2457[!is.na(sig.2457)]
+sig.3006 <- unique(ifn.ftest$x3006_4sU_60m_IFNvnoIFN$table[which(ifn.ftest$x3006_4sU_60m_IFNvnoIFN$table$PValue < 10e-6), "symbol"])
+sig.3006 <- sig.3006[!is.na(sig.3006)]
+sig.dmso <- unique(ifn.ftest$DMSO_4sU_60m_IFNvnoIFN$table[which(ifn.ftest$DMSO_4sU_60m_IFNvnoIFN$table$PValue < 10e-6), "symbol"])
+sig.dmso <- sig.dmso[!is.na(sig.dmso)]
+
+# make venn to get sizes
+myCol <- brewer.pal(3, "Pastel2")
+venn.list <- list("2457" = sig.2457, "3006" =  sig.3006, "DMSO" = sig.dmso)
+venn.diagram(
+  venn.list,
+  category.names = c("2457", "3006", "DMSO"), 
+  filename = file.path(iso.plots.dir, "venn_treatments_IFNvnoIFN.png"),
+  output = TRUE,
+  disable.logging = TRUE,
+  imagetype = "png",
+  lwd = 2,
+  lty = 'blank',
+  fill = myCol,
+  cex = .6,
+  fontface = "bold",
+  fontfamily = "sans",
+  cat.cex = 0.6,
+  cat.fontface = "bold",
+  cat.default.pos = "outer",
+  cat.pos = c(-27, 27, 135),
+  cat.dist = c(0.055, 0.055, 0.085),
+  cat.fontfamily = "sans",
+  rotation = 1
+)
+
+
+# get intersect of sig genes for each group for euler data
+euler.data <- euler(c(
+  "2457" = 79,
+  "3006" = 75,
+  "DMSO" = 24,
+  "2457&3006" = 113,
+  "2457&DMSO" = 11,
+  "3006&DMSO" = 5,
+  "2457&3006&DMSO" = 93
+))
+
+pdf(file.path(iso.plots.dir, "euler_treatments_IFNvnoIFN.pdf"))
+plot(euler.data, quantities = list(type = "counts"))
+dev.off()
+
+
+ItemList <- venn(venn.list, show.plot = FALSE)
+# write out each list of genes as a text file for Andrew
+write.table(
+  sig.2457,
+  file.path(iso.results.dir, "nascent_IFN_genes/2457_IFNv2457_DE_genes"),
+  sep = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  sig.3006,
+  file.path(iso.results.dir, "nascent_IFN_genes/3006_IFNv3006_DE_genes"),
+  sep = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  sig.dmso,
+  file.path(iso.results.dir, "nascent_IFN_genes/DMSO_IFNvDMSO_DE_genes"),
+  sep = "\t",
+  row.names = FALSE,
+  col.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make heatmap of genes sig diff in DMSO 
+```{r}
+norm.cpm <- cpm(counts.obs$Mm_TCcounts, normalized.lib.sizes = TRUE)
+# create matrix for heatmap: CPMs of 36 replicates from above comparisons and limit to drug.stab ENS IDs
+cpm60 <- norm.cpm[, grepl("60min", colnames(norm.cpm))]
+# remove "_3utr from counts to match properly
+rownames(cpm60) <- gsub("_3utr", "", rownames(cpm60))
+sig.dmso.enst <- unique(ifn.ftest$DMSO_4sU_60m_IFNvnoIFN$table[which(ifn.ftest$DMSO_4sU_60m_IFNvnoIFN$table$PValue < 10e-6), c("enst", "symbol")])
+cpm60 <- as.data.frame(cpm60[sig.dmso.enst$enst,])
+# sum reads for each gene 
+cpm60$symbol <- sig.dmso.enst$symbol
+cpm60 <- cpm60 %>% group_by(symbol) %>% summarize_all(sum)
+cpm60 <- as.data.frame(cpm60[-which(is.na(cpm60$symbol)), ])
+# replace enst with symbols as rownames for heatmap
+rownames(cpm60) <- cpm60$symbol
+cpm60 <- cpm60[, -1]
+
+# filter out < 1 cpm in all samples and log transform for readability
+keep <- rowMeans(cpm60) > 10
+cpm60.filter <- cpm60[keep,]
+cpm60.filter.log <- log2(1 + cpm60.filter)
+
+# make matrix
+heat.mat <- as.matrix(cpm60.filter.log)
+
+# heatmap of cpms for gene set
+pdf(file.path(iso.plots.dir, "Heatmap_DE_genes_DMSO_IFNvnoIFN.pdf"))
+Heatmap(heat.mat, use_raster = FALSE, column_names_gp = gpar(fontsize = 6), row_names_gp = gpar(fontsize = 2), col = magma(10))
+dev.off()
+```
+
+# improve heatmap for manuscript
+```{r}
+library(tidyr)
+library(tibble)
+
+norm.cpm <- cpm(counts.obs$Mm_TCcounts, normalized.lib.sizes = TRUE)
+# create matrix for heatmap: CPMs of 36 replicates from above comparisons and limit to drug.stab ENS IDs
+cpm.6h <- norm.cpm[, grepl("6hr", colnames(norm.cpm))]
+# remove "_3utr from counts to match properly
+rownames(cpm.6h) <- gsub("_3utr", "", rownames(cpm.6h))
+cpm.6h <- as.data.frame(cpm.6h[drug.stab$enst,])
+# sum reads for each gene
+cpm.6h$symbol <- drug.stab$symbol
+cpm.6h <- cpm.6h %>% group_by(symbol) %>% summarize_all(sum) %>% drop_na()
+# replace enst with symbols as rownames for heatmap
+cpm.6h <- tibble::column_to_rownames(cpm.6h, var = "symbol")
+
+# filter out < 1 cpm in all samples and log transform for readbility
+keep <- rowMeans(cpm.6h) > 10
+cpm.6h.filter <- cpm.6h[keep,]
+cpm.6h.filter.log <- log2(1 + cpm.6h.filter)
+
+# make matrix
+heat.mat <- as.matrix(cpm.6h.filter.log)
+
+# heatmap of cpms for gene set
+pdf(file.path(iso.plots.dir, "Heatmap_drug_stabilised_genes_inferno.pdf"))
+Heatmap(heat.mat, use_raster = FALSE, column_names_gp = gpar(fontsize = 5), row_names_gp = gpar(fontsize = 0.1), col = inferno(10), heatmap_legend_param = list(title = "log2(1+cpm)"))
+dev.off()
+```
+
+# make separate bar plots for IFN & noIFN
+```{r}
+# get mean across replicates
+# first for noIFN
+rep.mean.noifn <- cbind(
+  "DMSO" = mean(norm.sums[61:63]),
+  "DMSO_4sU_30m" = mean(norm.sums[64:66]),
+  "DMSO_4sU_60m" = mean(norm.sums[67:69]),
+  "2457" = mean(norm.sums[1:3]),
+  "2457_4sU_30m" = mean(norm.sums[4:6]),
+  "2457_4sU_60m" = mean(norm.sums[7:9]),
+  "3006" = mean(norm.sums[31:33]),
+  "3006_4sU_30m" = mean(norm.sums[34:36]),
+  "3006_4sU_60m" = mean(norm.sums[37:39])
+  )
+# get sd across replicates
+rep.sd.noifn <- cbind(
+  "DMSO" = sd(norm.sums[61:63]),
+  "DMSO_4sU_30m" = sd(norm.sums[64:66]),
+  "DMSO_4sU_60m" = sd(norm.sums[67:69]),
+  "2457" = sd(norm.sums[1:3]),
+  "2457_4sU_30m" = sd(norm.sums[4:6]),
+  "2457_4sU_60m" = sd(norm.sums[7:9]),
+  "3006" = sd(norm.sums[31:33]),
+  "3006_4sU_30m" = sd(norm.sums[34:36]),
+  "3006_4sU_60m" = sd(norm.sums[37:39])
+)
+# put data in correct format for plot
+bar.data.noifn <- data.frame(
+  name = colnames(rep.mean.noifn),
+  counts = t(rep.mean.noifn),
+  sd = t(rep.sd.noifn),
+  variable = rep(c("none", "4sU 30m", "4sU 60m"), 3)
+)
+# set order as factor 
+bar.data.noifn$name <- factor(bar.data.noifn$name, levels = bar.data.noifn$name)
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_early_noIFN.pdf"))
+ggplot(bar.data.noifn, aes(name, counts, fill = variable, color = variable)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(x = name, ymin = counts-sd, ymax = counts+sd), width = 0.4, colour = "grey30", alpha = 0.9, size = 1.3) +
+  scale_fill_manual("Interferon", values = c("none" = "coral3", "4sU 30m" = "darkslategray4", "4sU 60m" = "mediumpurple4")) + 
+  scale_color_manual("Interferon", values = c("none" = "coral3", "4sU 30m" = "darkslategray4", "4sU 60m" = "mediumpurple4")) + 
+  labs(x = "", y = "normalised counts") +    # set multiple labels at once
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) #+
+#  stat_compare_means(comparisons = p.comps) + 
+#  stat_compare_means(label.y = 2750000)
+dev.off()
+
+# get mean across replicates
+rep.mean.ifn <- cbind(
+  "DMSO_IFN" = mean(norm.sums[76:78]),
+  "DMSO_IFN_4sU_30m" = mean(norm.sums[79:81]),
+  "DMSO_IFN_4sU_60m" = mean(norm.sums[82:84]),
+  "2457_IFN" = mean(norm.sums[16:18]),
+  "2457_IFN_4sU_30m" = mean(norm.sums[19:21]),
+  "2457_IFN_4sU_60m" = mean(norm.sums[22:24]),
+  "3006_IFN" = mean(norm.sums[46:48]),
+  "3006_IFN_4sU_30m" = mean(norm.sums[49:51]),
+  "3006_IFN_4sU_60m" = mean(norm.sums[52:54])
+  )
+# get sd across replicates
+rep.sd.ifn <- cbind(
+  "DMSO_IFN" = sd(norm.sums[76:78]),
+  "DMSO_IFN_4sU_30m" = sd(norm.sums[79:81]),
+  "DMSO_IFN_4sU_60m" = sd(norm.sums[82:84]),
+  "2457_IFN" = sd(norm.sums[16:18]),
+  "2457_IFN_4sU_30m" = sd(norm.sums[19:21]),
+  "2457_IFN_4sU_60m" = sd(norm.sums[22:24]),
+  "3006_IFN" = sd(norm.sums[46:48]),
+  "3006_IFN_4sU_30m" = sd(norm.sums[49:51]),
+  "3006_IFN_4sU_60m" = sd(norm.sums[52:54])
+)
+# put data in correct format for plot
+bar.data.ifn <- data.frame(
+  name = colnames(rep.mean.ifn),
+  counts = t(rep.mean.ifn),
+  sd = t(rep.sd.ifn),
+  variable = rep(c("none", "4sU 30m", "4sU 60m"), 3)
+)
+# set order as factor 
+bar.data.ifn$name <- factor(bar.data.ifn$name, levels = bar.data.ifn$name)
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_early_IFN.pdf"))
+ggplot(bar.data.ifn, aes(name, counts, fill = variable, color = variable)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(x = name, ymin = counts-sd, ymax = counts+sd), width = 0.4, colour = "grey30", alpha = 0.9, size = 1.3) +
+  scale_fill_manual("Interferon", values = c("none" = "coral3", "4sU 30m" = "darkslategray4", "4sU 60m" = "mediumpurple4")) + 
+  scale_color_manual("Interferon", values = c("none" = "coral3", "4sU 30m" = "darkslategray4", "4sU 60m" = "mediumpurple4")) + 
+  labs(x = "", y = "normalised counts") +    # set multiple labels at once
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) #+
+#  stat_compare_means(comparisons = p.comps) + 
+#  stat_compare_means(label.y = 2750000)
+dev.off()
+```
+
+# find genes with DRACH sequence, each possibility run separately with no mismatches and appended to same output file
+```{bash}
+module load bowtie/1.2.2
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TTTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TTTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TTTGA >> reference_files/Mm10_DRACH_sequences.txt
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TCTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TCTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c TCTGA >> reference_files/Mm10_DRACH_sequences.txt
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CTTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CTTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CTTGA >> reference_files/Mm10_DRACH_sequences.txt
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CCTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CCTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c CCTGA >> reference_files/Mm10_DRACH_sequences.txt
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ATTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ATTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ATTGA >> reference_files/Mm10_DRACH_sequences.txt
+
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ACTGT >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ACTGG >> reference_files/Mm10_DRACH_sequences.txt
+bowtie -a -v 0 /data/reference/dawson_labs/genomes/mm10/Mus_musculus.GRCm38.dna.toplevel.fa -c ACTGA >> reference_files/Mm10_DRACH_sequences.txt
+```
+
+# intersect DRACH sequences with genes, make bed files first
+```{r}
+ref.dir <- file.path(project.dir, "reference_files")
+drach <- fread(file.path(ref.dir, "Mm10_DRACH_sequences.txt"))
+mm.genes <- fread(file.path(ref.dir, "mm10_ENSMUSG_symbol_ann.txt"))
+
+# only keep proper chr alignments
+drach <- drach[which(drach$V3 %in% c(1:19, "X", "Y"))]
+# make DRACH sequences into bed file use +/-1 bp to account for 0-based
+drach.bed <- cbind(drach$V3, drach$V4 - 1, drach$V4 + 1, drach$V5, drach$V6, drach$V2)
+write.table(
+  drach.bed,
+  file.path(ref.dir, "mm10_DRACH.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# now make genes into bed
+genes.bed <- mm.genes[, c(1:3, 5:6, 4)]
+write.table(
+  genes.bed,
+  file.path(ref.dir, "mm10_ENSMUSG_symbol_ann.bed"),
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# now use for bedtools intersect
+```{bash}
+module load bedtools/2.27.1
+
+bedtools intersect -a reference_files/mm10_ENSMUSG_symbol_ann.bed -b reference_files/mm10_DRACH.bed -wa -u > reference_files/mm10_DRACH_genes.bed
+```
+
+# intersect DRACH genes with stabilised lists
+```{r}
+drach.genes <- fread(file.path(ref.dir, "mm10_DRACH_genes.bed"))
+
+length(unique(drach.genes$V4))
+#[1] 52318
+
+nrow(mm.genes)
+#[1] 52636
+
+52318/52636
+#[1] 0.9939585
+
+### since DRACH sequence is present in >99% of genes, it will not be informative
+```
+
+# find "destabilised" transcripts for comparisons
+```{r}
+# get those down in drug only as "drug-destabilised"
+noifn2457.destab <- anti_join(noifn2457, noifnDMSO)
+noifn3006.destab <- anti_join(noifn3006, noifnDMSO)
+ifn2457.destab <- anti_join(ifn2457, ifnDMSO)
+ifn3006.destab <- anti_join(ifn3006, ifnDMSO)
+
+# make diff LFC table for destabilised genes
+noifn2457 <- ftest.list[["noIFN_2457_4sU_U_6hv4sU_6h"]]$table
+noifn3006 <- ftest.list[["noIFN_3006_4sU_U_6hv4sU_6h"]]$table
+noifnDMSO <- ftest.list[["noIFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+ifn2457 <- ftest.list[["IFN_2457_4sU_U_6hv4sU_6h"]]$table
+ifn3006 <- ftest.list[["IFN_3006_4sU_U_6hv4sU_6h"]]$table
+ifnDMSO <- ftest.list[["IFN_DMSO_4sU_U_6hv4sU_6h"]]$table
+
+
+n2.destab <- noifn2457[which(noifn2457$enst %in% noifn2457.destab$enst), c("enst", "symbol", "logFC")]
+n2d.destab <- noifnDMSO[which(noifnDMSO$enst %in% noifn2457.destab$enst), c("enst", "symbol", "logFC")]
+n3.destab <- noifn3006[which(noifn3006$enst %in% noifn3006.destab$enst), c("enst", "symbol", "logFC")]
+n3d.destab <- noifnDMSO[which(noifnDMSO$enst %in% noifn3006.destab$enst), c("enst", "symbol", "logFC")]
+i2.destab <- ifn2457[which(ifn2457$enst %in% ifn2457.destab$enst), c("enst", "symbol", "logFC")]
+i2d.destab <- ifnDMSO[which(ifnDMSO$enst %in% ifn2457.destab$enst), c("enst", "symbol", "logFC")]
+i3.destab <- ifn3006[which(ifn3006$enst %in% ifn3006.destab$enst), c("enst", "symbol", "logFC")]
+i3d.destab <- ifnDMSO[which(ifnDMSO$enst %in% ifn3006.destab$enst), c("enst", "symbol", "logFC")]
+
+# make table with each drug and dmso comb LFC values and diff between them, then write out
+n2d.lfc.destab <- merge(n2.destab, n2d.destab, by = c("enst", "symbol"))
+colnames(n2d.lfc.destab)[3:4] <- c("logFC_2457", "logFC_DMSO")
+n2d.lfc.destab$diff_logFC <- n2d.lfc.destab$logFC_2457 - n2d.lfc.destab$logFC_DMSO
+n2d.lfc.destab <- n2d.lfc.destab[-which(is.na(n2d.lfc.destab$symbol)), ]
+n2d.lfc.destab <- n2d.lfc.destab[order(n2d.lfc.destab$diff_logFC, decreasing = FALSE), ]
+write.table(
+  n2d.lfc.destab,
+  file.path(iso.results.dir, "drug_stabilised/2457_noIFN_destabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+n3d.lfc.destab <- merge(n3.destab, n3d.destab, by = c("enst", "symbol"))
+colnames(n3d.lfc.destab)[3:4] <- c("logFC_3006", "logFC_DMSO")
+n3d.lfc.destab$diff_logFC <- n3d.lfc.destab$logFC_3006 - n3d.lfc.destab$logFC_DMSO
+n3d.lfc.destab <- n3d.lfc.destab[-which(is.na(n3d.lfc.destab$symbol)), ]
+n3d.lfc.destab <- n3d.lfc.destab[order(n3d.lfc.destab$diff_logFC, decreasing = FALSE), ]
+write.table(
+  n3d.lfc.destab,
+  file.path(iso.results.dir, "drug_stabilised/3006_noIFN_destabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i2d.lfc.destab <- merge(i2.destab, i2d.destab, by = c("enst", "symbol"))
+colnames(i2d.lfc.destab)[3:4] <- c("logFC_2457_IFN", "logFC_DMSO_IFN")
+i2d.lfc.destab$diff_logFC <- i2d.lfc.destab$logFC_2457_IFN - i2d.lfc.destab$logFC_DMSO_IFN
+i2d.lfc.destab <- i2d.lfc.destab[-which(is.na(i2d.lfc.destab$symbol)), ]
+i2d.lfc.destab <- i2d.lfc.destab[order(i2d.lfc.destab$diff_logFC, decreasing = FALSE), ]
+write.table(
+  i2d.lfc.destab,
+  file.path(iso.results.dir, "drug_stabilised/2457_IFN_destabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+i3d.lfc.destab <- merge(i3.destab, i3d.destab, by = c("enst", "symbol"))
+colnames(i3d.lfc.destab)[3:4] <- c("logFC_3006_IFN", "logFC_DMSO_IFN")
+i3d.lfc.destab$diff_logFC <- i3d.lfc.destab$logFC_3006_IFN - i3d.lfc.destab$logFC_DMSO_IFN
+i3d.lfc.destab <- i3d.lfc.destab[-which(is.na(i3d.lfc.destab$symbol)), ]
+i3d.lfc.destab <- i3d.lfc.destab[order(i3d.lfc.destab$diff_logFC, decreasing = FALSE), ]
+write.table(
+  i3d.lfc.destab,
+  file.path(iso.results.dir, "drug_stabilised/3006_IFN_destabilised_transcripts_diff_LFC.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make single bar plot with IFN & noIFN ordered separately & coloured by drug
+```{r}
+# get mean across replicates
+rep.mean.all <- cbind(
+  "DMSO" = mean(norm.sums[61:63]),
+  "DMSO_4sU_30m" = mean(norm.sums[64:66]),
+  "DMSO_4sU_60m" = mean(norm.sums[67:69]),
+  "2457" = mean(norm.sums[1:3]),
+  "2457_4sU_30m" = mean(norm.sums[4:6]),
+  "2457_4sU_60m" = mean(norm.sums[7:9]),
+  "3006" = mean(norm.sums[31:33]),
+  "3006_4sU_30m" = mean(norm.sums[34:36]),
+  "3006_4sU_60m" = mean(norm.sums[37:39]),
+  "DMSO_IFN" = mean(norm.sums[76:78]),
+  "DMSO_IFN_4sU_30m" = mean(norm.sums[79:81]),
+  "DMSO_IFN_4sU_60m" = mean(norm.sums[82:84]),
+  "2457_IFN" = mean(norm.sums[16:18]),
+  "2457_IFN_4sU_30m" = mean(norm.sums[19:21]),
+  "2457_IFN_4sU_60m" = mean(norm.sums[22:24]),
+  "3006_IFN" = mean(norm.sums[46:48]),
+  "3006_IFN_4sU_30m" = mean(norm.sums[49:51]),
+  "3006_IFN_4sU_60m" = mean(norm.sums[52:54])
+  )
+# get sd across replicates
+rep.sd.all <- cbind(
+  "DMSO" = sd(norm.sums[61:63]),
+  "DMSO_4sU_30m" = sd(norm.sums[64:66]),
+  "DMSO_4sU_60m" = sd(norm.sums[67:69]),
+  "2457" = sd(norm.sums[1:3]),
+  "2457_4sU_30m" = sd(norm.sums[4:6]),
+  "2457_4sU_60m" = sd(norm.sums[7:9]),
+  "3006" = sd(norm.sums[31:33]),
+  "3006_4sU_30m" = sd(norm.sums[34:36]),
+  "3006_4sU_60m" = sd(norm.sums[37:39]),
+  "DMSO_IFN" = sd(norm.sums[76:78]),
+  "DMSO_IFN_4sU_30m" = sd(norm.sums[79:81]),
+  "DMSO_IFN_4sU_60m" = sd(norm.sums[82:84]),
+  "2457_IFN" = sd(norm.sums[16:18]),
+  "2457_IFN_4sU_30m" = sd(norm.sums[19:21]),
+  "2457_IFN_4sU_60m" = sd(norm.sums[22:24]),
+  "3006_IFN" = sd(norm.sums[46:48]),
+  "3006_IFN_4sU_30m" = sd(norm.sums[49:51]),
+  "3006_IFN_4sU_60m" = sd(norm.sums[52:54])
+)
+# put data in correct format for plot
+bar.data.all <- data.frame(
+  name = colnames(rep.mean.all),
+  counts = t(rep.mean.all),
+  sd = t(rep.sd.all),
+  variable = rep(c(rep("DMSO", 3), rep("2457", 3), rep("3006", 3)), 2)
+)
+# set order as factor 
+bar.data.all$name <- factor(bar.data.all$name, levels = bar.data.all$name)
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_early.pdf"))
+ggplot(bar.data.all, aes(name, counts, fill = variable, color = variable)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(x = name, ymin = counts-sd, ymax = counts+sd), width = 0.4, colour = "grey30", alpha = 0.9, size = 1.3) +
+  scale_fill_manual("Drug", values = c("DMSO" = "coral3", "2457" = "darkslategray4", "3006" = "mediumpurple4")) + 
+  scale_color_manual("Drug", values = c("DMSO" = "coral3", "2457" = "darkslategray4", "3006" = "mediumpurple4")) + 
+  labs(x = "", y = "normalised counts") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+dev.off()
+```
+
+# make barplot as above, but with all rep data points rather than sd
+```{r}
+names.all <- c(
+  rep("DMSO", 3),
+  rep("DMSO_4sU_30m", 3),
+  rep("DMSO_4sU_60m", 3),
+  rep("2457", 3),
+  rep("2457_4sU_30m", 3),
+  rep("2457_4sU_60m", 3),
+  rep("3006", 3),
+  rep("3006_4sU_30m", 3),
+  rep("3006_4sU_60m", 3),
+  rep("DMSO_IFN", 3),
+  rep("DMSO_IFN_4sU_30m", 3),
+  rep("DMSO_IFN_4sU_60m", 3),
+  rep("2457_IFN", 3),
+  rep("2457_IFN_4sU_30m", 3),
+  rep("2457_IFN_4sU_60m", 3),
+  rep("3006_IFN", 3),
+  rep("3006_IFN_4sU_30m", 3),
+  rep("3006_IFN_4sU_60m", 3)
+)
+
+counts.all <- c(
+  norm.sums[61:63],
+  norm.sums[64:66],
+  norm.sums[67:69],
+  norm.sums[1:3],
+  norm.sums[4:6],
+  norm.sums[7:9],
+  norm.sums[31:33],
+  norm.sums[34:36],
+  norm.sums[37:39],
+  norm.sums[76:78],
+  norm.sums[79:81],
+  norm.sums[82:84],
+  norm.sums[16:18],
+  norm.sums[19:21],
+  norm.sums[22:24],
+  norm.sums[46:48],
+  norm.sums[49:51],
+  norm.sums[52:54]
+  )
+
+point.data <- data.frame(
+  name = as.factor(names.all),
+  counts = counts.all,
+  variable = rep(c(rep("DMSO", 9), rep("2457", 9), rep("3006", 9)), 2)
+)
+
+pdf(file = file.path(iso.plots.dir, "barplots/barplot_TMMnorm_TCcounts_early_datapoints.pdf"))
+ggplot(bar.data.all, aes(name, counts, fill = variable, color = variable)) +
+  geom_col(alpha = 0.7) +
+  geom_point(point.data, mapping = aes(y = counts, x = name)) + 
+  scale_fill_manual("Drug", values = c("DMSO" = "grey40", "2457" = "deepskyblue1", "3006" = "khaki3")) + 
+  scale_color_manual("Drug", values = c("DMSO" = "grey30", "2457" = "deepskyblue4", "3006" = "khaki4")) + 
+  labs(x = "", y = "normalised counts") + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+dev.off()
+```
+
+
+# limit stab & destab lists to diff >1
+```{r}
+n2d.lfc1.stab <- n2d.lfc.table[which(n2d.lfc.table$diff_logFC > 1),]
+n3d.lfc1.stab <- n3d.lfc.table[which(n3d.lfc.table$diff_logFC > 1),]
+i2d.lfc1.stab <- i2d.lfc.table[which(i2d.lfc.table$diff_logFC > 1),]
+i3d.lfc1.stab <- i3d.lfc.table[which(i3d.lfc.table$diff_logFC > 1),]
+
+n2d.lfc1.destab <- n2d.lfc.destab[which(n2d.lfc.destab$diff_logFC < -1),]
+n3d.lfc1.destab <- n3d.lfc.destab[which(n3d.lfc.destab$diff_logFC < -1),]
+i2d.lfc1.destab <- i2d.lfc.destab[which(i2d.lfc.destab$diff_logFC < -1),]
+i3d.lfc1.destab <- i3d.lfc.destab[which(i3d.lfc.destab$diff_logFC < -1),]
+```
+
+# remake boxplot with refined stab list (threshold already used for GSEA plots)
+```{r}
+# get counts for >1LFC stab transcripts
+n2.stab.counts <- all.norm[n2d.lfc1.stab$enst, c(10:15, 70:75)]
+n3.stab.counts <- all.norm[n3d.lfc1.stab$enst, c(40:45, 70:75)]
+i2.stab.counts <- all.norm[i2d.lfc1.stab$enst, c(25:30, 85:90)]
+i3.stab.counts <- all.norm[i3d.lfc1.stab$enst, c(55:60, 85:90)]
+
+n2.stab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(n2.stab.counts[, 10:12])/rowMeans(n2.stab.counts[, 7:9])), log2(rowMeans(n2.stab.counts[, 4:6])/rowMeans(n2.stab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n2.stab.counts)), rep("drug", nrow(n2.stab.counts)))
+)
+
+n3.stab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(n3.stab.counts[, 10:12])/rowMeans(n3.stab.counts[, 7:9])), log2(rowMeans(n3.stab.counts[, 4:6])/rowMeans(n3.stab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n3.stab.counts)), rep("drug", nrow(n3.stab.counts)))
+)
+
+i2.stab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(i2.stab.counts[, 10:12])/rowMeans(i2.stab.counts[, 7:9])), log2(rowMeans(i2.stab.counts[, 4:6])/rowMeans(i2.stab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i2.stab.counts)), rep("drug", nrow(i2.stab.counts)))
+)
+
+i3.stab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(i3.stab.counts[, 10:12])/rowMeans(i3.stab.counts[, 7:9])), log2(rowMeans(i3.stab.counts[, 4:6])/rowMeans(i3.stab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i3.stab.counts)), rep("drug", nrow(i3.stab.counts)))
+)
+
+# make single plot with all FC groups
+all.stab.box <- rbind(n2.stab.box, n3.stab.box, i2.stab.box, i3.stab.box)
+all.stab.box$tx <- c(rep("2457", nrow(n2.stab.box)), rep("3006", nrow(n3.stab.box)), rep("2457+IFN", nrow(i2.stab.box)), rep("3006+IFN", nrow(i3.stab.box)))
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_4sU_Uv4sU_TCcounts_ALL_stab_LFC1.pdf"))
+ggboxplot(all.stab.box, x = "tx", y = "LFC", color = "treatment", palette = "jco") +
+  labs(x = "drug stabilised transcripts", y = "log2 fold change 4sU_U/4sU") + 
+  stat_compare_means(aes(group = treatment), label = "p.signif")
+dev.off()
+```
+
+# also make boxplots for destabilised 
+```{r}
+# get counts for >1LFC stab transcripts
+n2.destab.counts <- all.norm[n2d.lfc1.destab$enst, c(10:15, 70:75)]
+n3.destab.counts <- all.norm[n3d.lfc1.destab$enst, c(40:45, 70:75)]
+i2.destab.counts <- all.norm[i2d.lfc1.destab$enst, c(25:30, 85:90)]
+i3.destab.counts <- all.norm[i3d.lfc1.destab$enst, c(55:60, 85:90)]
+
+n2.destab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(n2.destab.counts[, 10:12])/rowMeans(n2.destab.counts[, 7:9])), log2(rowMeans(n2.destab.counts[, 4:6])/rowMeans(n2.destab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n2.destab.counts)), rep("drug", nrow(n2.destab.counts)))
+)
+
+n3.destab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(n3.destab.counts[, 10:12])/rowMeans(n3.destab.counts[, 7:9])), log2(rowMeans(n3.destab.counts[, 4:6])/rowMeans(n3.destab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(n3.destab.counts)), rep("drug", nrow(n3.destab.counts)))
+)
+
+i2.destab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(i2.destab.counts[, 10:12])/rowMeans(i2.destab.counts[, 7:9])), log2(rowMeans(i2.destab.counts[, 4:6])/rowMeans(i2.destab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i2.destab.counts)), rep("drug", nrow(i2.destab.counts)))
+)
+
+i3.destab.box <- data.frame(
+  "LFC" = c(log2(rowMeans(i3.destab.counts[, 10:12])/rowMeans(i3.destab.counts[, 7:9])), log2(rowMeans(i3.destab.counts[, 4:6])/rowMeans(i3.destab.counts[, 1:3]))),
+  "treatment" = c(rep("control", nrow(i3.destab.counts)), rep("drug", nrow(i3.destab.counts)))
+)
+
+# make single plot with all FC groups
+all.destab.box <- rbind(n2.destab.box, n3.destab.box, i2.destab.box, i3.destab.box)
+all.destab.box$tx <- c(rep("2457", nrow(n2.destab.box)), rep("3006", nrow(n3.destab.box)), rep("2457+IFN", nrow(i2.destab.box)), rep("3006+IFN", nrow(i3.destab.box)))
+
+pdf(file = file.path(iso.plots.dir, "boxplots/boxplot_LFC_4sU_Uv4sU_TCcounts_ALL_destab_LFC1.pdf"))
+ggboxplot(all.destab.box, x = "tx", y = "LFC", color = "treatment", palette = "jco") +
+  labs(x = "drug destabilised transcripts", y = "log2 fold change 4sU_U/4sU") + 
+  stat_compare_means(aes(group = treatment), label = "p.signif")
+dev.off()
+```
+
+# make stab vs destab plots, first look at density/ridgeline plots
+```{r}
+library(viridis)
+library(ggridges)
+
+iso.dens.dir <- file.path(iso.plots.dir, "density_plots")
+iso.ridge.dir <- file.path(iso.plots.dir, "ridgeline")
+iso.vio.dir <- file.path(iso.plots.dir, "violin")
+
+n2.stab.dens <- data.frame(
+  "LFC" = c(
+    log2(rowMeans(n2.stab.counts[, 4:6])/rowMeans(n2.stab.counts[, 1:3])), 
+    log2(rowMeans(n2.stab.counts[, 10:12])/rowMeans(n2.stab.counts[, 7:9])),
+    log2(rowMeans(n2.destab.counts[, 4:6])/rowMeans(n2.destab.counts[, 1:3])),
+    log2(rowMeans(n2.destab.counts[, 10:12])/rowMeans(n2.destab.counts[, 7:9]))
+    ),
+  "group" = c(
+    rep("stabilised drug", nrow(n2.stab.counts)), 
+    rep("stabilised control", nrow(n2.stab.counts)), 
+    rep("destabilised drug", nrow(n2.destab.counts)), 
+    rep("destabilised control", nrow(n2.destab.counts)))
+)
+
+pdf(file = file.path(iso.dens.dir, "density_LFC_4sU_Uv4sU_TCcounts_2457_ALL_LFC1.pdf"))
+ggplot(data=n2.stab.dens, aes(x=LFC, group=group, fill=group)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_bw() +
+    scale_fill_viridis(discrete=TRUE) +
+    scale_color_viridis(discrete=TRUE) +
+    ggtitle("2457 stabilised and destabilised transcripts")
+dev.off()
+
+# also make ridgeline plot for visibility
+n2.stab.dens <- n2.stab.dens[which(is.finite(n2.stab.dens$LFC)),]
+# set order as factor 
+n2.stab.dens$group <- factor(n2.stab.dens$group, levels = n2.stab.dens$group)
+
+pdf(file = file.path(iso.ridge.dir, "ridgeline_LFC_4sU_Uv4sU_TCcounts_2457_ALL_LFC1.pdf"))
+ggplot(data=n2.stab.dens, aes(x=LFC, y=group, fill=group)) +
+  geom_density_ridges() +
+  theme_ridges() + 
+  scale_fill_viridis(discrete=TRUE) + 
+  theme(legend.position = "none")
+dev.off()
+
+n3.stab.dens <- data.frame(
+  "LFC" = c(
+    log2(rowMeans(n3.stab.counts[, 4:6])/rowMeans(n3.stab.counts[, 1:3])), 
+    log2(rowMeans(n3.stab.counts[, 10:12])/rowMeans(n3.stab.counts[, 7:9])),
+    log2(rowMeans(n3.destab.counts[, 4:6])/rowMeans(n3.destab.counts[, 1:3])),
+    log2(rowMeans(n3.destab.counts[, 10:12])/rowMeans(n3.destab.counts[, 7:9]))
+    ),
+  "group" = c(
+    rep("stabilised drug", nrow(n3.stab.counts)), 
+    rep("stabilised control", nrow(n3.stab.counts)), 
+    rep("destabilised drug", nrow(n3.destab.counts)), 
+    rep("destabilised control", nrow(n3.destab.counts)))
+)
+
+pdf(file = file.path(iso.dens.dir, "density_LFC_4sU_Uv4sU_TCcounts_3006_ALL_LFC1.pdf"))
+ggplot(data=n3.stab.dens, aes(x=LFC, group=group, fill=group)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_bw() +
+    scale_fill_viridis(discrete=TRUE) +
+    scale_color_viridis(discrete=TRUE) +
+    ggtitle("3006 stabilised and destabilised transcripts")
+dev.off()
+
+i2.stab.dens <- data.frame(
+  "LFC" = c(
+    log2(rowMeans(i2.stab.counts[, 4:6])/rowMeans(i2.stab.counts[, 1:3])), 
+    log2(rowMeans(i2.stab.counts[, 10:12])/rowMeans(i2.stab.counts[, 7:9])),
+    log2(rowMeans(i2.destab.counts[, 4:6])/rowMeans(i2.destab.counts[, 1:3])),
+    log2(rowMeans(i2.destab.counts[, 10:12])/rowMeans(i2.destab.counts[, 7:9]))
+    ),
+  "group" = c(
+    rep("stabilised drug", nrow(i2.stab.counts)), 
+    rep("stabilised control", nrow(i2.stab.counts)), 
+    rep("destabilised drug", nrow(i2.destab.counts)), 
+    rep("destabilised control", nrow(i2.destab.counts)))
+)
+
+pdf(file = file.path(iso.dens.dir, "density_LFC_4sU_Uv4sU_TCcounts_2457IFN_ALL_LFC1.pdf"))
+ggplot(data=i2.stab.dens, aes(x=LFC, group=group, fill=group)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_bw() +
+    scale_fill_viridis(discrete=TRUE) +
+    scale_color_viridis(discrete=TRUE) +
+    ggtitle("2457+IFN stabilised and destabilised transcripts")
+dev.off()
+
+i3.stab.dens <- data.frame(
+  "LFC" = c(
+    log2(rowMeans(i3.stab.counts[, 4:6])/rowMeans(i3.stab.counts[, 1:3])), 
+    log2(rowMeans(i3.stab.counts[, 10:12])/rowMeans(i3.stab.counts[, 7:9])),
+    log2(rowMeans(i3.destab.counts[, 4:6])/rowMeans(i3.destab.counts[, 1:3])),
+    log2(rowMeans(i3.destab.counts[, 10:12])/rowMeans(i3.destab.counts[, 7:9]))
+    ),
+  "group" = c(
+    rep("stabilised drug", nrow(i3.stab.counts)), 
+    rep("stabilised control", nrow(i3.stab.counts)), 
+    rep("destabilised drug", nrow(i3.destab.counts)), 
+    rep("destabilised control", nrow(i3.destab.counts)))
+)
+
+pdf(file = file.path(iso.dens.dir, "density_LFC_4sU_Uv4sU_TCcounts_3006IFN_ALL_LFC1.pdf"))
+ggplot(data=i3.stab.dens, aes(x=LFC, group=group, fill=group)) +
+    geom_density(adjust=1.5, alpha=.4) +
+    theme_bw() +
+    scale_fill_viridis(discrete=TRUE) +
+    scale_color_viridis(discrete=TRUE) +
+    ggtitle("3006+IFN stabilised and destabilised transcripts")
+dev.off()
+
+# have a look at these as violins
+
+pdf(file = file.path(iso.plots.dir, "violinplot_LFC_TCcounts_ALL_stab.pdf"))
+ggplot(all.box.data, aes(x = treatment, y = LFC, fill = conditions, palette = "jco")) +
+  geom_violin() + 
+  stat_compare_means(aes(group = conditions), label = "p.signif")
+dev.off()
+
+n2.stab.dens$treatment <- strsplit2(n2.stab.dens$group, " ")[,2]
+n2.stab.dens$group <- strsplit2(n2.stab.dens$group, " ")[,1]
+pdf(file = file.path(iso.vio.dir, "violinplot_LFC_4sU_Uv4sU_TCcounts_2457_ALL_LFC1.pdf"))
+ggplot(n2.stab.dens, aes(x = group, y = LFC, fill = treatment)) +
+  geom_violin(alpha=0.8) + 
+  theme_bw() + 
+  scale_fill_manual(values = c("cyan4", "darkgoldenrod3")) +
+  ggtitle("2457 stabilised and destabilised transcripts")
+dev.off()
+
+n3.stab.dens$treatment <- strsplit2(n3.stab.dens$group, " ")[,2]
+n3.stab.dens$group <- strsplit2(n3.stab.dens$group, " ")[,1]
+pdf(file = file.path(iso.vio.dir, "violinplot_LFC_4sU_Uv4sU_TCcounts_3006_ALL_LFC1.pdf"))
+ggplot(n3.stab.dens, aes(x = group, y = LFC, fill = treatment)) +
+  geom_violin(alpha=0.8) + 
+  theme_bw() + 
+  scale_fill_manual(values = c("cyan4", "darkgoldenrod3")) +
+  ggtitle("3006 stabilised and destabilised transcripts")
+dev.off()
+
+i2.stab.dens$treatment <- strsplit2(i2.stab.dens$group, " ")[,2]
+i2.stab.dens$group <- strsplit2(i2.stab.dens$group, " ")[,1]
+pdf(file = file.path(iso.vio.dir, "violinplot_LFC_4sU_Uv4sU_TCcounts_2457IFN_ALL_LFC1.pdf"))
+ggplot(i2.stab.dens, aes(x = group, y = LFC, fill = treatment)) +
+  geom_violin(alpha=0.8) + 
+  theme_bw() + 
+  scale_fill_manual(values = c("cyan4", "darkgoldenrod3")) +
+  ggtitle("2457+IFN stabilised and destabilised transcripts")
+dev.off()
+
+i3.stab.dens$treatment <- strsplit2(i3.stab.dens$group, " ")[,2]
+i3.stab.dens$group <- strsplit2(i3.stab.dens$group, " ")[,1]
+pdf(file = file.path(iso.vio.dir, "violinplot_LFC_4sU_Uv4sU_TCcounts_3006IFN_ALL_LFC1.pdf"))
+ggplot(i3.stab.dens, aes(x = group, y = LFC, fill = treatment)) +
+  geom_violin(alpha=0.8) + 
+  theme_bw() + 
+  scale_fill_manual(values = c("cyan4", "darkgoldenrod3")) +
+  ggtitle("3006+IFN stabilised and destabilised transcripts")
+dev.off()
+```
+
+# volcano of just stab/destab 
+```{r}
+n2.stab.vol.drug <- ftest.list$noIFN_2457_4sU_U_6hv4sU_6h$table[which(ftest.list$noIFN_2457_4sU_U_6hv4sU_6h$table$enst %in% n2d.lfc1.stab$enst | ftest.list$noIFN_2457_4sU_U_6hv4sU_6h$table$enst %in% n2d.lfc1.destab$enst),]
+
+ keyvals <- ifelse(
+    n2.stab.vol.drug$enst %in% n2d.lfc1.stab$enst, 'firebrick2',
+      ifelse(n2.stab.vol.drug$enst %in% n2d.lfc1.destab$enst, 'dodgerblue2',
+        'black'))
+
+n2.stab.vol.dmso<- ftest.list$noIFN_DMSO_4sU_U_6hv4sU_6h$table[which(ftest.list$noIFN_DMSO_4sU_U_6hv4sU_6h$table$enst %in% n2d.lfc1.stab$enst | ftest.list$noIFN_DMSO_4sU_U_6hv4sU_6h$table$enst %in% n2d.lfc1.destab$enst),]
+
+ keyvals <- ifelse(
+    n2.stab.vol.dmso$enst %in% n2d.lfc1.stab$enst, 'firebrick2',
+      ifelse(n2.stab.vol.dmso$enst %in% n2d.lfc1.destab$enst, 'dodgerblue2',
+        'black'))
+
+stab.comps <- c("noIFN_2457_4sU_U_6hv4sU_6h", "noIFN_DMSO_4sU_U_6hv4sU_6h")
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  keyvals <- ifelse(
+    ftest.list[[contrast.i]]$table$enst %in% n2d.lfc1.stab$enst, 'firebrick2',
+      ifelse(ftest.list[[contrast.i]]$table$enst %in% n2d.lfc1.destab$enst, 'dodgerblue2',
+        'grey90'))
+  keyvals[is.na(keyvals)] <- 'black'
+  names(keyvals)[keyvals == 'firebrick2'] <- 'stabilised'
+  names(keyvals)[keyvals == 'dodgerblue2'] <- 'destabilised'
+  names(keyvals)[keyvals == 'grey90'] <- 'neutral'
+  pdf(file.path(vol.dir, paste0(colnames(contr.matrix)[contrast.i], "stab_destab_volcano_plot.pdf")))
+  EnhancedVolcano(
+    ftest.list[[contrast.i]]$table,
+    lab = ftest.list[[contrast.i]]$table$symbol,
+    x = "logFC",
+    y = "PValue",
+    title = colnames(contr.matrix)[contrast.i],
+    drawConnectors = TRUE,
+    widthConnectors = 0.75,
+    colCustom = keyvals,
+    FCcutoff = 1.0
+    )
+  dev.off()
+}
+```
+
+
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(session.dir, paste0(Sys.Date(), "_slamseq_analysis_220622.txt"))
+)
+```
