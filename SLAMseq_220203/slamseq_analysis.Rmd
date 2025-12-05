@@ -1,0 +1,571 @@
+---
+title: "Andrew G SLAM-Seq Analysis 2022 Feb"
+output: html_notebook
+---
+
+# Experimental design:
+looking at transcript stability, 2 drug treatments V DMSO under 3 conditions (none, 4sU, 4sU_U(wash))
+
+# Location of files:
+Run:
+/pipeline/Runs/NextSeq/220203_NB501056_0755_AHFFWCBGXL/ProjectFolders/Project_Kathy-Knezevic
+
+# Setting up references and running SLAM-Seq pipeline
+
+```{r}
+project.dir <- "/dawson_genomics/Projects/METTL3i/SLAMseq/220203_NB501056_0755_AHFFWCBGXL"
+ref.dir <- file.path(project.dir, "reference_files")
+log.dir <- file.path(project.dir, "logs")
+align.dir <- file.path(project.dir, "alignment")
+plots.dir <- file.path(project.dir, "plots")
+sample.dir <- file.path(project.dir, "sample_info")
+session.dir <- file.path(project.dir, "session_info")
+
+dir.create(log.dir)
+dir.create(align.dir)
+dir.create(plots.dir)
+dir.create(sample.dir)
+dir.create(session.dir)
+dir.create(ref.dir)
+setwd(project.dir)
+```
+
+# make UTR bed from mouse genome, then cat w/Dm UTR bed from Vicky analysis for MmDm combined UTR bed
+```{bash}
+python scripts/extract_transcript_regions.py -i /data/reference/gtf/Mus_musculus.GRCm38.90.gtf -o reference_files/Mus_musculus.GRCm38.90 --gtf
+
+cat reference_files/Mus_musculus.GRCm38.90_3utr.bed /dawson_genomics/Projects/zebrafish/SLAMSeq/210922_NB501056_0694_AHJJHWBGXK/reference_files/Dm6allutrsort.bed > reference_files/Mm10Dm6utr.bed
+```
+
+# create joint genome from Mm38 and reheaded Dm6
+```{bash, eval = F}
+cat /data/reference/indexes/mouse/ensembl_GRCm38.78/fasta/Mus_musculus.GRCm38.dna.toplevel.fa /home/agillespie/Drosophila_melanogaster.BDGP6.dna.toplevel.reheaded.fa > /data/reference/dawson_labs/joint_genomes/Mm38Dm6/Mm38Dm6.fa
+```
+
+run fastqc first
+```{bash, eval = F}
+module load fastqc/0.11.6
+module load multiqc/1.8
+mkdir fastqc
+
+for fq in /pipeline/Runs/NextSeq/220203_NB501056_0755_AHFFWCBGXL/ProjectFolders/Project_Kathy-Knezevic/*/*.fastq.gz
+do 
+sbatch ../scripts/fastqc.sbatch $fq
+done
+
+multiqc ./fastqc
+```
+
+Slam-seq samples through slam.sbatch from alignment dir
+```{bash, eval = F}
+cd alignment
+
+for fq in /pipeline/Runs/NextSeq/220203_NB501056_0755_AHFFWCBGXL/ProjectFolders/Project_Kathy-Knezevic/*/*.fastq.gz
+do sbatch ../scripts/slam220203.sbatch $fq
+done
+```
+
+# run multiqc on fastqc and slamdunk files
+```{bash}
+# still in alignment dir to run multiqc
+module load multiqc/1.8
+multiqc .
+```
+### moved first multiqc report and data to original trimmed fastq dir (/alignment/fastq/)
+
+
+# Initial analysis shows that library appears to be reverse stranded, as SLAM-DUNK does not have a parameter for library strandedness, just reverse complement trimmed reads and re-run
+# Use seqtk to get RC of trimmed fastqs, run from alignment directory
+```{bash}
+module load seqtk/1.0
+mkdir fastq_RC
+
+for fq in /dawson_genomics/Projects/METTL3i/SLAMseq_220203_NB501056_0755_AHFFWCBGXL/alignment/fastq/*trim.fq.gz
+do
+bname=`basename $fq .trim.fq.gz`
+seqtk seq -r $fq > ./fastq_RC/${bname}_RC.trim.fastq 
+done
+```
+
+# re-run SLAM-DUNK pipeline on reverse complemented reads (still from alignment dir)
+```{bash, eval = F}
+for fq in /dawson_genomics/Projects/METTL3i/SLAMseq_220203_NB501056_0755_AHFFWCBGXL/alignment/fastq_RC/*_RC.trim.fastq
+do sbatch ../scripts/slam220203.sbatch $fq
+done
+```
+
+# run multiqc on new slamdunk output and reverse complemented fastqs, ignore previous fastqs
+```{bash}
+# still in alignment dir to run multiqc
+module load multiqc/1.8
+multiqc -f .
+```
+
+# After the alignments are done there is a collapse folder with all the counts
+
+# Change collapse .csv files to .tsv
+```{bash, eval = F}
+cd collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+```
+
+# Read in slam-dunk collapse counts files
+
+Slamdunk Tcount file format:
+col1 is entrez geneID
+col3 is RPM
+col8 is total count
+col9 is TC count
+
+Loading and reading in files
+```{r}
+# set dirs for analysis and create as needed
+tsv.dir <- file.path(align.dir, 'collapse/tsv')
+results.dir <- file.path(project.dir, 'results')
+
+dir.create(results.dir)
+
+setwd(project.dir)
+
+library(edgeR)
+sample.sheet <- read.table(file.path(sample.dir, "sample_info.txt"), sep = "\t", header = TRUE)
+
+sample.info = data.frame(
+  "files" = sample.sheet$file, 
+  "samples" = paste0(sample.sheet$treatment, "_", sample.sheet$conditions), 
+  "treatment" = sample.sheet$treatment,
+  "conditions" = sample.sheet$conditions
+  )
+
+# sequencing and sample information
+counts = readDGE(
+  file = sample.info$files, 
+  path = tsv.dir, 
+  columns=c(1,8), 
+  group=sample.info$samples
+  )
+
+TCcounts = readDGE(
+  file = sample.info$files,
+  path = tsv.dir,
+  columns=c(1,9), 
+  group=sample.info$samples
+  )
+
+# cleaning up names
+rownames(counts$samples) <- gsub("_RC.trim_slamdunk_mapped_filtered_tcount_collapsed", "", rownames(counts$samples))
+rownames(TCcounts$samples) <- gsub("_RC.trim_slamdunk_mapped_filtered_tcount_collapsed", "", rownames(TCcounts$samples))
+rownames(counts$samples) <- gsub("M3i-KK24-B16-F10-", "", rownames(counts$samples))
+rownames(TCcounts$samples) <- gsub("M3i-KK24-B16-F10-", "", rownames(TCcounts$samples))
+colnames(counts$counts) <- gsub("M3i-KK24-B16-F10-", "", colnames(counts$counts))
+colnames(TCcounts$counts) <- gsub("M3i-KK24-B16-F10-", "", colnames(TCcounts$counts))
+colnames(counts$counts) <- gsub("_RC.trim_slamdunk_mapped_filtered_tcount_collapsed", "", colnames(counts$counts))
+colnames(TCcounts$counts) <- gsub("_RC.trim_slamdunk_mapped_filtered_tcount_collapsed", "", colnames(TCcounts$counts))
+```
+
+# write out raw counts
+```{r}
+raw_counts = counts$counts
+raw_TCcounts = TCcounts$counts
+
+write.table(
+  raw_counts, 
+  "results/counts_raw_all.txt",
+  sep = "\t",
+  quote = FALSE
+  )
+
+write.table(
+  raw_TCcounts, 
+  "results/TCcounts_raw_all.txt",
+  sep = "\t",
+  quote = FALSE
+  )
+```
+
+# separate organisms counts objects and make list for looping to analyse separately until normalisation
+```{r}
+dros <- which(substr(rownames(counts), 1, 4) == "FBgn")
+
+dm.counts <- counts[dros, ]
+mm.counts <- counts[-dros, ]
+dm.TCcounts <- TCcounts[dros, ]
+mm.TCcounts <- TCcounts[-dros, ]
+
+counts.obs <- list(mm.counts, mm.TCcounts, dm.counts, dm.TCcounts)
+```
+
+# Filtering out counts of genes with low counts
+```{r}
+# init variable for cpms list
+counts.cpms.list <- list()
+
+# loop through both counts objects to apply same filtering to both
+for(counts.i in 1:length(counts.obs)){
+  colSums(counts.obs[[counts.i]]$counts)
+  noint = rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  table(noint)
+  counts.cpms.list[[counts.i]] = cpm(counts.obs[[counts.i]])
+  keep = rowSums(counts.cpms.list[[counts.i]] > 1) >= 1 & !noint
+  counts.obs[[counts.i]] = counts.obs[[counts.i]][keep,]
+  dim(counts.obs[[counts.i]]$counts)
+}
+
+# set names for lists
+names(counts.obs) <- c("Mm_counts", "Mm_TCcounts", "Dm_counts", "Dm_TCcounts")
+names(counts.cpms.list) <- names(counts.obs)
+```
+
+
+Save filtered mouse count files
+```{r}
+for(i in 1:2){
+  write.table(
+    counts.obs[[i]]$counts,
+    file.path(results.dir, paste0(names(counts.obs)[i], "_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )
+
+  write.table(
+    counts.cpms.list[[i]],
+    file.path(results.dir, paste0(names(counts.obs)[i], "_cpms_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )  
+}
+```
+
+Read saved counts
+```{r}
+counts = read.delim(file = "results/Mm_counts_filtered.txt", sep = "\t")
+TCcounts = read.delim(file = "results/Mm_TCcounts_filtered.txt", sep = "\t")
+```
+
+# Plot count numbers
+```{r}
+pdf(file = file.path(plots.dir, "barplots_summary.pdf"), width = 6, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts), 
+  las = 2, 
+  main = "Total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  colSums(TCcounts), 
+  las = 2, 
+  main = "T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  colSums(TCcounts)/colSums(counts)*100, 
+  las = 2, 
+  main = "Percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+dev.off()
+```
+
+# Plot raw drosophila reads for comparison
+```{r}
+pdf(file = file.path(plots.dir, "Dm_barplots_summary.pdf"), width = 6, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$Dm_counts$counts), 
+  las = 2, 
+  main = "Dm total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  colSums(counts.obs$Dm_TCcounts$counts), 
+  las = 2, 
+  main = "Dm TC reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  colSums(counts.obs$Dm_TCcounts$counts)/colSums(counts.obs$Dm_counts$counts)*100, 
+  las = 2, 
+  main = "Dm percentage TC", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+dev.off()
+```
+
+
+# make table of TC%
+```{r}
+TC.table <- data.frame(
+  "sample.names" = sample.info$samples, 
+  "percent.TC" = colSums(TCcounts)/colSums(counts)*100
+  )
+TC.table
+```
+
+# MDS plot unnorm counts
+```{r}
+library(RColorBrewer)
+# Setting colours
+col.group <- as.factor(sample.info$samples)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Set1") 
+
+pdf(file.path(plots.dir, "MDS_Mm_unnorm_counts.pdf"))
+MDS = plotMDS(
+  counts.obs[["Mm_counts"]],
+  labels = counts.obs[["Mm_counts"]]$samples$group, 
+  col = levels(col.group),
+  main = "Unnormalised counts"
+  )
+dev.off()
+```
+
+# MDS plot unnorm TC counts
+```{r}
+pdf(file.path(plots.dir, "MDS_Mm_unnorm_TCcounts.pdf"))
+MDS = plotMDS(
+  counts.obs[["Mm_TCcounts"]],
+  labels = counts.obs[["Mm_TCcounts"]]$samples$group, 
+  col = levels(col.group),
+  main = "Unnormalised T>C counts"
+  )
+dev.off()
+```
+
+# Use TMM as normalisation factor for Dm and apply that to Mm
+```{r}
+Dm.counts.norm <- calcNormFactors(counts.obs$Dm_counts, method = "TMM")
+#Dm.TCcounts.norm <- calcNormFactors(counts.obs$Dm_TCcounts, method = "TMM")
+counts.obs$Mm_counts$samples$norm.factors <- Dm.counts.norm$samples$norm.factors
+counts.obs$Mm_TCcounts$samples$norm.factors <- Dm.counts.norm$samples$norm.factors
+Mm.counts.norm <- counts.obs$Mm_counts
+Mm.TCcounts.norm <- counts.obs$Mm_TCcounts
+```
+
+# MDS for normalised data
+```{r}
+pdf(file.path(plots.dir, "MDS_Mm_norm_counts.pdf"))
+MDS = plotMDS(
+  Mm.counts.norm,
+  labels = Mm.counts.norm$samples$group, 
+  main = "Normalised counts",
+  col = levels(col.group)
+  )
+dev.off()
+```
+
+# MDS of normalised TCcounts dims 1, 2, &3
+```{r}
+pdf(file.path(plots.dir, "MDS_Mm_norm_TCcounts_dims1_2.pdf"))
+MDS = plotMDS(
+  Mm.TCcounts.norm,
+  labels = Mm.TCcounts.norm$samples$group, 
+  main = "Normalised T>C counts",
+  col = levels(col.group), 
+  dim.plot = c(1, 2)
+  )
+dev.off()
+
+pdf(file.path(plots.dir, "MDS_Mm_norm_TCcounts_dims1_3.pdf"))
+MDS = plotMDS(
+  Mm.TCcounts.norm,
+  labels = Mm.TCcounts.norm$samples$group, 
+  main = "Normalised T>C counts",
+  col = levels(col.group), 
+  dim.plot = c(1, 3)
+  )
+dev.off()
+
+pdf(file.path(plots.dir, "MDS_Mm_norm_TCcounts_dims2_3.pdf"))
+MDS = plotMDS(
+  Mm.TCcounts.norm,
+  labels = Mm.TCcounts.norm$samples$group, 
+  main = "Normalised T>C counts",
+  col = levels(col.group), 
+  dim.plot = c(2, 3)
+  )
+dev.off()
+```
+
+# Plot normalised count numbers
+```{r}
+pdf(file = file.path(plots.dir, "Normalised_barplots_summary.pdf"), width = 6, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(Mm.counts.norm$counts) * Mm.counts.norm$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised total reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  colSums(Mm.TCcounts.norm$counts) * Mm.TCcounts.norm$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised T>C reads", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+barplot(
+  (colSums(Mm.TCcounts.norm$counts)*Mm.counts.norm$samples$norm.factors) / (colSums(Mm.counts.norm$counts)*Mm.TCcounts.norm$samples$norm.factors) * 100, 
+  las = 2, 
+  main = "Normalised percentage T>C", 
+  names.arg = sample.info$samples,
+  col = c("coral1", "darkslategray3", "mediumpurple3")
+  )
+dev.off()
+```
+
+# set design and contrasts for diff analysis
+```{r}
+# first need to make names syntactically valid
+Mm.TCcounts.norm$samples$group <- make.names(Mm.TCcounts.norm$samples$group)
+
+# design table
+design = model.matrix(~0+group, data = Mm.TCcounts.norm$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+contr.matrix <- makeContrasts(
+  X4sUvNone_DMSO = DMSO_4sU - DMSO_None, 
+  X4sUvNone_2457 = X2457_4sU - X2457_None,  
+  X4sUvNone_3006 = X3006_4sU - X3006_None,  
+  X4sUv4sU_U_DMSO = DMSO_4sU - DMSO_4sU_U, 
+  X4sUv4sU_U_2457 = X2457_4sU - X2457_4sU_U,  
+  X4sUv4sU_U_3006 = X3006_4sU - X3006_4sU_U,
+  X4sU_UvNone_DMSO = DMSO_4sU_U - DMSO_None, 
+  X4sU_UvNone_2457 = X2457_4sU_U - X2457_None,  
+  X4sU_UvNone_3006 = X3006_4sU_U - X3006_None,
+  X2457vDMSO_4sU = X2457_4sU - DMSO_4sU,  
+  X3006vDMSO_4sU = X3006_4sU - DMSO_4sU,
+  X2457vDMSO_None = X2457_None - DMSO_None,  
+  X3006vDMSO_None = X3006_None - DMSO_None,
+  X2457vDMSO_4sU_U = X2457_4sU_U - DMSO_4sU_U,  
+  X3006vDMSO_4sU_U = X3006_4sU_U - DMSO_4sU_U,
+  levels = design
+  )
+contr.matrix
+```
+
+# make ann file from gtf used for utr bed
+```{r}
+library(Rsubread)
+
+mm10.gff.name <- flattenGTF(
+    "/data/reference/gtf/Mus_musculus.GRCm38.90.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "gene_name",
+    method = "merge"
+    )
+
+mm10.gff.ens <- flattenGTF(
+    "/data/reference/gtf/Mus_musculus.GRCm38.90.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "transcript_id",
+    method = "merge"
+    )
+
+gene.ann <- merge(
+  mm10.gff.name, 
+  mm10.gff.ens, 
+  by.x = c("Chr", "Start", "End", "Strand"), 
+  by.y = c("Chr", "Start", "End", "Strand")
+  )
+colnames(gene.ann)[5:6] <- c("Symbol", "ENST")
+
+# write out to refs
+write.table(
+  gene.ann,
+  file.path(ref.dir, "mm10_ENST_symbol_ann.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+
+# cannot estimate dispersion without replicates
+# start with edger for diff analysis, For counts first
+# just use estimated dispersion as 0.1 (genetically identical model organisms), not reliable stats but okay for exploratory
+```{r}
+counts_glm <- glmFit(Mm.counts.norm, design = design, dispersion = 0.1)
+
+#set and make output dir
+edger.dir <- file.path(results.dir, "edger")
+dir.create(edger.dir)
+
+# initialise list
+contrast.list <- list()
+
+for(contr.i in 1:length(colnames(contr.matrix))){
+  fit <- glmLRT(counts_glm, contrast = contr.matrix[ , contr.i])
+  contrast.list[[colnames(contr.matrix)[contr.i]]] <- topTags(fit, sort.by = "PValue", n = 1000)
+  contrast.list[[contr.i]]$table$ENST <- gsub("_3utr", "", rownames(contrast.list[[contr.i]]))
+  contrast.list[[contr.i]]$table <- merge(contrast.list[[contr.i]], gene.ann, by.x = "ENST", by.y = "ENST")
+  # re-order after merging
+  contrast.list[[contr.i]]$table <- contrast.list[[contr.i]]$table[order(contrast.list[[contr.i]]$table$PValue), ]
+  write.table(
+    contrast.list[[contr.i]]$table,
+    file.path(edger.dir, paste0("Counts_", colnames(contr.matrix)[contr.i], "_DE.txt")),
+    sep = "\t",
+    quote = F,
+    row.names = F,
+    col.names = T
+    )
+
+  pdf(file.path(plots.dir, paste0("MAplot_Counts_", names(contrast.list)[[contr.i]], ".pdf")))
+  plotMD(
+    fit,
+    main = names(contrast.list)[[contr.i]]
+    )
+  dev.off()
+}
+```
+
+# Now same for TCcounts
+```{r}
+TCcounts_glm <- glmFit(Mm.TCcounts.norm, design = design, dispersion = 0.1)
+
+# initialise list
+TCcontrast.list <- list()
+
+for(contr.i in 1:length(colnames(contr.matrix))){
+  fit <- glmLRT(TCcounts_glm, contrast = contr.matrix[ , contr.i])
+  TCcontrast.list[[colnames(contr.matrix)[contr.i]]] <- topTags(fit, sort.by = "PValue", n = 1000)
+  TCcontrast.list[[contr.i]]$table$ENST <- gsub("_3utr", "", rownames(TCcontrast.list[[contr.i]]))
+  TCcontrast.list[[contr.i]]$table <- merge(TCcontrast.list[[contr.i]], gene.ann, by.x = "ENST", by.y = "ENST")
+  # re-order after merging
+  TCcontrast.list[[contr.i]]$table <- TCcontrast.list[[contr.i]]$table[order(TCcontrast.list[[contr.i]]$table$PValue), ]
+  write.table(
+    TCcontrast.list[[contr.i]]$table,
+    file.path(edger.dir, paste0("TCcounts_", colnames(contr.matrix)[contr.i], "_DE.txt")),
+    sep = "\t",
+    quote = F,
+    row.names = F,
+    col.names = T
+    )
+
+  pdf(file.path(plots.dir, paste0("MAplot_TCcounts_", names(contrast.list)[[contr.i]], ".pdf")))
+  plotMD(
+    fit,
+    main = names(contrast.list)[[contr.i]]
+    )
+  dev.off()
+}
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(session.dir, paste0(Sys.Date(), "_slamseq_analysis_220203.txt"))
+)
+```
