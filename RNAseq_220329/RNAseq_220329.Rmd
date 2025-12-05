@@ -1,0 +1,469 @@
+---
+title: "RNAseq_220329"
+author: "Andrea"
+date: '2023-03-06'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+### This is building on a previous project analysed by Chih, here is the location of data and files from the original project
+# Location of files
+Working directory:
+/dawson_genomics/Projects/METTL3i/RNASeq/220329_NB501056_0778_AHNGNMBGXL/alignment
+
+Location of fastq files:
+/pipeline/Archives/NextSeq/220329_NB501056_0778_AHNGNMBGXL/ProjectFolders/Project_Kathy-Knezevic/
+
+Location of bam files:
+/researchers/kathy.knezevic/RNA-QuantSeq/220620_NB501056_0817_AHHHM3BGXM/
+
+# Alignment information
+/data/reference/indexes/mouse/mm10/bowtie2/Tophat2_transcriptome_data/Mus_musculus.GRCm38.78.gtf
+
+### current project scratch dir: 
+/scratch/teams/dawson_genomics/Projects/METTL3i/RNAseq/220329_NB501056_0778_AHNGNMBGXL
+
+
+# set paths
+```{r}
+scratch.dir <- "/scratch/teams/dawson_genomics/Projects/METTL3i/RNAseq/220329_NB501056_0778_AHNGNMBGXL"
+proj.dir <- "/dawson_genomics/Projects/METTL3i/RNASeq/220329_NB501056_0778_AHNGNMBGXL/"
+session.dir <- file.path(scratch.dir, "session-info")
+counts.dir <- file.path(scratch.dir, "counts")
+```
+
+# align and get counts per transcript
+```{bash}
+for fq in /pipeline/Archives/NextSeq/220329_NB501056_0778_AHNGNMBGXL/ProjectFolders/Project_Kathy-Knezevic/*/*fastq.gz
+do
+sbatch scripts/hisat2_mm10.sbatch $fq
+done
+
+# run multiqc after script is done
+module load multiqc/1.8
+multiqc -x logs/ .
+```
+
+
+# load counts into edger
+```{r}
+library(edgeR)
+
+files <- list.files(counts.dir)
+
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub(".count", "", gsub("M3i-KK25-", "", files)),  
+  "cells" = c(rep("AT3", 18), rep("B16", 18)),
+  "treatment" = rep(c(rep("2457", 6), rep("3006", 6), rep("DMSO", 6)), 2),
+  "time" = rep(c(rep("24hr", 3), rep("48hr", 3)), 6),
+  "replicate" = rep(c(1:3), 12)
+  )
+
+sample.ann$group <- paste(sample.ann$cells, sample.ann$treatment, sample.ann$time, sep = "_")
+
+dge.counts = readDGE(
+  file = sample.ann$files, 
+  path = counts.dir,
+  group = sample.ann$group
+  )
+
+# simplify names
+colnames(dge.counts$counts) <- sample.ann$samples
+rownames(dge.counts$samples) <- sample.ann$samples
+```
+
+# Filtering out genes with low counts & not useful
+```{r}
+noint <- rownames(dge.counts$counts) %in% c("__no_feature", "__ambiguous", "__too_low_aQual","__not_aligned","__alignment_not_unique")
+counts.cpms <- cpm(dge.counts$counts)
+keep <- rowSums(counts.cpms > 1 ) >= 3 & !noint
+dim(dge.counts$counts)
+dge.counts$counts <- dge.counts$counts[keep,]
+dim(dge.counts$counts)
+```
+
+# calc TMM norm and write out file
+```{r}
+results.dir <- file.path(scratch.dir, "results")
+
+dge.counts <- calcNormFactors(dge.counts, method = "TMM")
+
+# multiply counts by norm factors
+counts.norm <- dge.counts$counts%*%diag(dge.counts$samples$norm.factors)
+colnames(counts.norm) <- sample.ann$samples
+write.table(
+  counts.norm,
+  file.path(results.dir, "Filtered_TMMnorm_counts.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# set design and contrasts for DE
+```{r}
+# design table
+design = model.matrix(~0+group, data = dge.counts$samples)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+
+contr.matrix <- makeContrasts(
+  AT3_2457vDMSO_24hr = AT3_2457_24hr-AT3_DMSO_24hr,
+  AT3_2457vDMSO_48hr = AT3_2457_48hr-AT3_DMSO_48hr,
+  AT3_3006vDMSO_24hr = AT3_3006_24hr-AT3_DMSO_24hr,
+  AT3_3006vDMSO_48hr = AT3_3006_48hr-AT3_DMSO_48hr,
+  B16_2457vDMSO_24hr = B16_2457_24hr-B16_DMSO_24hr,
+  B16_2457vDMSO_48hr = B16_2457_48hr-B16_DMSO_48hr,
+  B16_3006vDMSO_24hr = B16_3006_24hr-B16_DMSO_24hr,
+  B16_3006vDMSO_48hr = B16_3006_48hr-B16_DMSO_48hr,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# make gene ann table from BM
+```{r}
+library(biomaRt)
+
+Mmensembl=useMart(
+  host = "https://asia.ensembl.org", 
+  biomart = "ENSEMBL_MART_ENSEMBL",
+  dataset = "mmusculus_gene_ensembl"
+  )
+
+mm.ann = getBM(
+  attributes = c("ensembl_gene_id", "ensembl_transcript_id", "external_gene_name", "entrezgene_id"), 
+  mart = Mmensembl,
+  uniqueRows = TRUE
+  )
+
+# write out for future use
+write.table(
+  mm.ann,
+  "/data/reference/dawson_labs/biomart_annotations/Mmusculus/ENSMUSG_ENSMUST_name_entrezGeneID.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# use edgeR for DE
+```{r}
+library(dplyr)
+
+# estimate dispersion
+dge.counts = estimateDisp(dge.counts, design)
+
+gfit <- glmQLFit(dge.counts, design)
+edger.dir <- file.path(results.dir, "edger")
+
+ftest.list <- list()
+iso.ftest.list <- list()
+sig.ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[ , contrast.i])
+  ftest.list[[contrast.i]]$table$ensmust <- rownames(ftest.list[[contrast.i]]$table)
+  ftest.list[[contrast.i]]$table <- merge(ftest.list[[contrast.i]]$table, mm.ann, by.x = "ensmust", by.y = "ensembl_transcript_id")
+  # order by gene ID so isoforms are next to one another
+  ftest.list[[contrast.i]]$table <- ftest.list[[contrast.i]]$table[order(ftest.list[[contrast.i]]$table$ensembl_gene_id),]
+  # write ftest table
+  write.table(
+    ftest.list[[contrast.i]]$table,
+    file.path(edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+  
+  # limit to gene with multiple isoforms
+  iso.ftest.list[[contrast.i]] <- ftest.list[[contrast.i]]$table[ftest.list[[contrast.i]]$table$ensembl_gene_id %in% ftest.list[[contrast.i]]$table$ensembl_gene_id[duplicated(ftest.list[[contrast.i]]$table$ensembl_gene_id)], ]
+  # get only sig in at least 1 isoform
+  sig.ftest.list[[contrast.i]] <- iso.ftest.list[[contrast.i]] %>% group_by(ensembl_gene_id) %>% mutate(minP = min(PValue)) %>% filter(minP <= 0.05)
+  # write out table 
+  write.table(
+    sig.ftest.list[[contrast.i]],
+    file.path(edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table_sig_iso_only.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+
+# add contrast names to list
+names(ftest.list) <- colnames(contr.matrix)
+names(iso.ftest.list) <- colnames(contr.matrix)
+names(sig.ftest.list) <- colnames(contr.matrix)
+```
+
+
+# also get editing-aware alignments using slamseq 
+```{bash}
+for fq in /pipeline/Archives/NextSeq/220329_NB501056_0778_AHNGNMBGXL/ProjectFolders/Project_Kathy-Knezevic/*/*fastq.gz
+do
+sbatch scripts/slamdunk.sbatch $fq
+done
+```
+
+# Change collapse .csv files to .tsv
+```{bash}
+cd SLAMout/collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+```
+
+# look at differentially edited genes (as in slamseq)
+```{r}
+tsv.dir <- file.path(scratch.dir, "SLAMout/collapse/tsv")
+slam.res.dir <- file.path(scratch.dir, "SLAMresults")
+
+# get a list of all TCcount files
+files <- list.files(tsv.dir)
+# simplify names to use as sample names
+snames <- gsub("M3i-KK25-", "", gsub("_R1_001_trimmed.fq_slamdunk_mapped_filtered_tcount_collapsed.tsv", "", files))
+
+# make edger object from TCcounts files, use column 8 for counts and column 9 for TC counts
+counts = readDGE(
+  file = files, 
+  path = tsv.dir, 
+  columns = c(1, 8), 
+  group = sample.ann$group
+  )
+
+TCcounts = readDGE(
+  file = files,
+  path = tsv.dir,
+  columns = c(1, 9), 
+  group = sample.ann$group
+  )
+
+# cleaning up names
+rownames(counts$samples) <- snames
+rownames(TCcounts$samples) <- snames
+colnames(counts$counts) <- snames
+colnames(TCcounts$counts) <- snames
+```
+
+# Filtering out counts of genes with low counts
+```{r}
+# make object of both edger obs for looping
+counts.obs <- list(counts, TCcounts)
+names(counts.obs) <- c("counts", "TCcounts")
+# init variable for cpms list
+cpms.list <- list()
+
+# loop through counts object, get cpms and apply same filtering to both
+for(counts.i in 1:length(counts.obs)){
+  cpms.list[[counts.i]] <- cpm(counts.obs[[counts.i]])
+  noint <- rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  # only keep those with at least 1 cpm in at least 3 samples
+  keep <- rowSums(cpms.list[[counts.i]] > 1) >= 3 & !noint
+  dim(counts.obs[[counts.i]])
+  counts.obs[[counts.i]] <- counts.obs[[counts.i]][keep,]
+  cpms.list[[counts.i]] <- cpms.list[[counts.i]][keep,]
+  dim(counts.obs[[counts.i]])
+  
+  write.table(
+    counts.obs[[counts.i]]$counts,
+    file.path(slam.res.dir, paste0(names(counts.obs)[counts.i], "_filtered.txt")),
+    sep = "\t",
+    quote = F
+    )
+
+  write.table(
+    cpms.list[[counts.i]],
+    file.path(slam.res.dir, paste0(names(counts.obs)[counts.i], "_cpms_filtered.txt")),
+    sep = "\t",
+    quote = F
+    ) 
+}
+```
+
+# check edited counts in all samples
+```{r}
+barplot(
+  colSums(counts.obs$counts$counts), 
+  las = 2, 
+  main = "all reads", 
+#  names.arg = snames,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+
+barplot(
+  colSums(counts.obs$TCcounts$counts), 
+  las = 2, 
+  main = "edited reads", 
+#  names.arg = snames,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+
+barplot(
+  colSums(tc.counts)/colSums(counts)*100, 
+  las = 2, 
+  main = "% T>C", 
+#  names.arg = snames,
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+```
+
+# simplify variables of filtered counts
+```{r}
+counts <- counts.obs$counts$counts
+tc.counts <- counts.obs$TCcounts$counts
+```
+
+# MDS plot unnorm counts, make separate plots for IFN and noIFN
+```{r}
+library(pals)
+library(RColorBrewer)
+
+slam.plots.dir <- file.path(scratch.dir, "SLAMplots")
+
+# Setting colours, first for no IFN, coloured by conditions
+col.group <- as.factor(TCcounts$samples$group)
+levels(col.group) <- brewer.pal(nlevels(col.group), "Paired") 
+
+pdf(file.path(slam.plots.dir, "MDS_unnorm_counts.pdf"))
+MDS = plotMDS(
+  counts.obs$counts,
+  labels = counts.obs$counts$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised counts"
+  )
+dev.off()
+
+pdf(file.path(slam.plots.dir, "MDS_unnorm_edited_counts.pdf"))
+MDS = plotMDS(
+  counts.obs$TCcounts,
+  labels = counts.obs$counts$samples$group, 
+  col = as.vector(col.group),
+  main = "Unnormalised edited counts"
+  )
+dev.off()
+```
+
+# Use TMM as normalisation factor for counts dataset, then apply to TCcounts
+```{r}
+counts.obs$counts <- calcNormFactors(counts.obs$counts, method = "TMM")
+counts.obs$TCcounts$samples$norm.factors <- counts.obs$counts$samples$norm.factors
+```
+
+# MDS plot for TMM norm counts
+```{r}
+pdf(file.path(slam.plots.dir, "MDS_TMMnorm_counts.pdf"))
+MDS = plotMDS(
+  counts.obs$counts,
+  labels = counts.obs$counts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised counts"
+  )
+dev.off()
+
+pdf(file.path(slam.plots.dir, "MDS_TMMnorm_edited_counts.pdf"))
+MDS = plotMDS(
+  counts.obs$TCcounts,
+  labels = counts.obs$counts$samples$group, 
+  col = as.vector(col.group),
+  main = "TMM normalised edited counts"
+  )
+dev.off()
+```
+
+# Plot normalised count numbers
+```{r}
+pdf(file = file.path(slam.plots.dir, "barplots_TMMnormalised_summary.pdf"), width = 10, height = 4)
+par(mar = c(8, 5, 2, 0.2))
+barplot(
+  colSums(counts.obs$counts$counts) * counts.obs$counts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised total reads", 
+  names.arg = colnames(counts.obs$counts$counts),
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  colSums(counts.obs$TCcounts$counts) * counts.obs$TCcounts$samples$norm.factors, 
+  las = 2, 
+  main = "Normalised edited reads", 
+  names.arg = colnames(counts.obs$TCcounts$counts),
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+barplot(
+  (colSums(counts.obs$TCcounts$counts)*counts.obs$TCcounts$samples$norm.factors) / (colSums(counts.obs$counts$counts)*counts.obs$counts$samples$norm.factors) * 100, 
+  las = 2, 
+  main = "Normalised percentage edited", 
+  names.arg = colnames(counts.obs$TCcounts$counts),
+  col = c("coral1", "darkslategray3", "mediumpurple3"),
+  cex.names = 0.4
+  )
+dev.off()
+```
+
+# use edgeR for DE of TCcounts, design and contrasts same as specified above
+```{r}
+tc.dge <- counts.obs$TCcounts
+# estimate dispersion
+tc.dge = estimateDisp(tc.dge, design)
+
+gfit <- glmQLFit(tc.dge, design)
+slam.edger.dir <- file.path(slam.res.dir, "edger")
+
+tc.ftest.list <- list()
+tc.sig.ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+
+  tc.ftest.list[[contrast.i]] <- glmQLFTest(gfit, contrast = contr.matrix[ , contrast.i])
+  tc.ftest.list[[contrast.i]]$table$ensmust <- gsub("_3utr", "", rownames(tc.ftest.list[[contrast.i]]$table))
+  tc.ftest.list[[contrast.i]]$table <- merge(tc.ftest.list[[contrast.i]]$table, mm.ann, by.x = "ensmust", by.y = "ensembl_transcript_id")
+  # write ftest table
+  write.table(
+    tc.ftest.list[[contrast.i]]$table,
+    file.path(slam.edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+  
+  # get sig only
+  tc.sig.ftest.list[[contrast.i]] <- iso.ftest.list[[contrast.i]][which(iso.ftest.list[[contrast.i]]$PValue < 0.05),]
+  # write out table 
+  write.table(
+    tc.sig.ftest.list[[contrast.i]],
+    file.path(slam.edger.dir, paste0(colnames(contr.matrix)[contrast.i], "_ftest_table_sig_only.txt")),
+    sep = "\t",
+    quote = F,
+    col.names = T,
+    row.names= F
+  )
+}
+
+# add contrast names to list
+names(ftest.list) <- colnames(contr.matrix)
+names(tc.sig.ftest.list) <- colnames(contr.matrix)
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(session.dir, paste0(Sys.Date(), "_RNAseq_230214.txt"))
+)
+```
